@@ -18,7 +18,7 @@ dependencies = [
   "requests>=2.31.0",
   "termcolor",
   "torch>=2.7.0",
-  "triton==3.4.0",
+  "triton>=3.4.0",
   "safetensors>=0.5.3",
   "pytest>=8.4.1",
   "modelscope>=1.29.0",

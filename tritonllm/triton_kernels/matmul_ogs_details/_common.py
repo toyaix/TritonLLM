@@ -3,13 +3,14 @@ import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
+from tritonllm.utils import constexpr_function
 
 # -----------------------------------------------------------------------------
 #                                  Utilities
 # -----------------------------------------------------------------------------
 
 
-@tl.constexpr_function
+@constexpr_function
 def get_scaled_dot_format_string(dtype: tl.dtype):
     mapping = {
         tl.float16: "fp16",
