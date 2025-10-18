@@ -85,8 +85,12 @@ def init_env():
     # download o200k_base.tiktoken
     # save_file_to_tritonllm_bin_dir(tritonllm_bin_dir)
 
+if triton.__version__ == "3.4.0":
+    constexpr_function = tl.constexpr_function
+else:
+    constexpr_function = triton.runtime.jit.constexpr_function
 
-@tl.constexpr_function
+@constexpr_function
 def cuda_capability_eq(major, minor=0):
     """
     Determines whether we have compute capability == (major, minor) and

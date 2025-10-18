@@ -13,13 +13,14 @@ from triton_kernels.numerics_details.flexpoint import (
 )
 from triton_kernels.numerics_details.mxfp_details._downcast_to_mxfp import MXFP_BLOCK_SIZE
 from ._common import make_matmul_repr, matmul_launch_metadata, swizzle2d, xcd_swizzle, get_scaled_dot_format_string
+from tritonllm.utils import constexpr_function
 
 
-@tl.constexpr_function
+@constexpr_function
 def cuda_capability_geq(major, minor):
     return target_info.cuda_capability_geq(major, minor)
 
-@tl.constexpr_function
+@constexpr_function
 def get_dtype(tensor_or_desc: tl.tensor | tl.tensor_descriptor) -> tl.dtype:
     if isinstance(tensor_or_desc, tl.tensor):
         return tensor_or_desc.dtype.element_ty

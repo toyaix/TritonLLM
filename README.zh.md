@@ -15,7 +15,7 @@ LLM Inference via Triton 🚀
 </p>
 
 
-以 Triton 算子为核心的 LLM 推理，灵活且模块化。并以 [gpt-oss](https://github.com/openai/gpt-oss) 模型为起点，关注 Triton算子优化后的CUBIN二进制文件并使用[triton_runner](https://github.com/OpenMLIR/triton_runner)进行LLM推理。
+以 Triton 算子为核心的 LLM 推理，灵活且模块化。并以 [gpt-oss](https://github.com/openai/gpt-oss) 模型为起点，关注 Triton算子优化后的CUBIN二进制文件并使用[triton_runner](https://github.com/toyaix/triton_runner)进行LLM推理。
 
 将针对**RTX 5090**(Blackwell)进行优化。
 
@@ -86,7 +86,7 @@ usage: tritonllm [-h] [-r REASONING_EFFORT] [-a] [-b] [--show-browser-results] [
 ## 源码安装
 
 ```shell
-git clone https://github.com/OpenMLIR/tritonllm
+git clone https://github.com/toyaix/tritonllm
 cd tritonllm
 
 pip install -e .
