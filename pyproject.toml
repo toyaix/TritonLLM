@@ -33,7 +33,7 @@ authors = [
 license = "MIT"
 
 [project.urls]
-repository = "https://github.com/OpenMLIR/TritonLLM"
+repository = "https://github.com/toyaix/TritonLLM"
 homepage = "https://tritonllm.top"
 
 [build-system]

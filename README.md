@@ -14,7 +14,7 @@ Flexible and modular LLM inference for mini-batch
 <a ><b>English</b></a> | <a href="README.zh.md"><b>中文</b></a>
 </p>
 
-Implements modular [Triton](https://github.com/triton-lang/triton)-backed LLM inference with an emphasis on kernel optimization using CUBINs. The initial target is the [gpt-oss](https://github.com/openai/gpt-oss) model, executed via [triton_runner](https://github.com/OpenMLIR/triton_runner) and will be tuned for **RTX 5090** (sm120). Now support an NVIDIA GPU with [compute capability](https://developer.nvidia.com/cuda-gpus) sm120(RTX 5090, RTX PRO 6000, etc.), sm90(H100, H200, H20, etc.), sm80(A800, A100), sm89(RTX 4090, RTX 6000, L40, etc.) and sm86(RTX 3090, A10, etc.). If the GPU memory is greater than or equal to **24 GB**, you can run the **gpt-oss-20b**; if it is greater than or equal to **80 GB**, you can run the **gpt-oss-120b**.
+Implements modular [Triton](https://github.com/triton-lang/triton)-backed LLM inference with an emphasis on kernel optimization using CUBINs. The initial target is the [gpt-oss](https://github.com/openai/gpt-oss) model, executed via [triton_runner](https://github.com/toyaix/triton_runner) and will be tuned for **RTX 5090** (sm120). Now support an NVIDIA GPU with [compute capability](https://developer.nvidia.com/cuda-gpus) sm120(RTX 5090, RTX PRO 6000, etc.), sm90(H100, H200, H20, etc.), sm80(A800, A100), sm89(RTX 4090, RTX 6000, L40, etc.) and sm86(RTX 3090, A10, etc.). If the GPU memory is greater than or equal to **24 GB**, you can run the **gpt-oss-20b**; if it is greater than or equal to **80 GB**, you can run the **gpt-oss-120b**.
 
 ## Quick Installation
 
@@ -71,7 +71,7 @@ usage: tritonllm [-h] [-r REASONING_EFFORT] [-a] [-b] [--show-browser-results] [
 ## Install from source
 
 ```shell
-git clone https://github.com/OpenMLIR/tritonllm
+git clone https://github.com/toyaix/tritonllm
 cd tritonllm
 
 pip install -e .
@@ -126,5 +126,4 @@ triton_kernels is a set of kernels that enable fast moe on different architectur
 
 Original code here https://github.com/triton-lang/triton/tree/main/python/triton_kernels
 
-The current version is the following commit de4376e90a3c2b5ca30ada25a50cccadeadf7f1a and use BlackwellMXValueLayout with commit 19ca20fda4cfd3ae0d3eabde5e547db581fbb7ee。 
-
+The current version is the following commit de4376e90a3c2b5ca30ada25a50cccadeadf7f1a and use BlackwellMXValueLayout with commit 19ca20fda4cfd3ae0d3eabde5e547db581fbb7ee。
