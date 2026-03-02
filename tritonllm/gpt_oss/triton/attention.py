@@ -112,9 +112,10 @@ def _attn_fwd(
     q = tl.load(Q_block_ptr)
 
     if BANDWIDTH:
-        lo, hi = tl.maximum(start_q, start_q + start_m * BLOCK_M - BANDWIDTH), start_q + (start_m + 1) * BLOCK_M
+        lo, hi = tl.maximum(0, start_q + start_m * BLOCK_M - BANDWIDTH), start_q + (start_m + 1) * BLOCK_M
     else:
-        lo, hi = start_q, start_q + (start_m + 1) * BLOCK_M
+        lo, hi = 0, start_q + (start_m + 1) * BLOCK_M
+    hi = tl.minimum(hi, N_KV_CTX)
 
     # advance the KV block-pointers so they point at `lo`
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))

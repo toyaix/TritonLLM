@@ -59,9 +59,10 @@ def _attn_fwd(
     q = Q.load([off_z, off_h, start_m * BLOCK_M, 0]).reshape([BLOCK_M, HEAD_DIM])
 
     if BANDWIDTH:
-        lo, hi = tl.maximum(start_q, start_q + start_m * BLOCK_M - BANDWIDTH), start_q + (start_m + 1) * BLOCK_M
+        lo, hi = tl.maximum(0, start_q + start_m * BLOCK_M - BANDWIDTH), start_q + (start_m + 1) * BLOCK_M
     else:
-        lo, hi = start_q, start_q + (start_m + 1) * BLOCK_M
+        lo, hi = 0, start_q + (start_m + 1) * BLOCK_M
+    hi = tl.minimum(hi, N_KV_CTX)
 
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -230,7 +231,7 @@ def test_eq(batch_size, num_queries, num_keys, num_key_value_heads, num_key_valu
     torch.testing.assert_close(o1, o2)
 
 if __name__ == "__main__":
-    batch_size, num_queries, num_keys, num_key_value_heads, num_key_value_groups, head_dim, sm_scale, sliding_window, start_q = 1,64,8192,8,8,64,0.125, None, 0
+    batch_size, num_queries, num_keys, num_key_value_heads, num_key_value_groups, head_dim, sm_scale, sliding_window, start_q = 1,64,8192,8,8,64,0.125, None, 3
     num_queries = 70
     q = torch.randn(batch_size, num_queries, num_key_value_heads, num_key_value_groups, head_dim).bfloat16().cuda()
     k = torch.randn(batch_size, num_keys, num_key_value_heads, head_dim).bfloat16().cuda()
