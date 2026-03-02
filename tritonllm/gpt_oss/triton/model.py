@@ -8,12 +8,14 @@ import torch
 from torch.profiler import profile, record_function, ProfilerActivity
 
 from gpt_oss.triton.weights import Checkpoint
+from gpt_oss.triton.attention_ref import attention_ref
+from gpt_oss.triton.attention_tt_decode import attention_decode
 
 from triton_kernels.target_info import cuda_capability_geq, cuda_capability_eq
-if not cuda_capability_geq(9) or cuda_capability_eq(12):
-    from gpt_oss.triton.attention import attention, attention_ref
+if not cuda_capability_geq(9):
+    from gpt_oss.triton.attention_tt import attention
 else:
-    from gpt_oss.triton.attention_with_tma import attention, attention_ref
+    from gpt_oss.triton.attention_tt_tma import attention
 
 from gpt_oss.triton.moe import quantize_mx4, moe
 from gpt_oss.triton.triton_kernels import rmsnorm_forward, rope_forward, unembedding_forward
@@ -305,7 +307,17 @@ class AttentionBlock(torch.nn.Module):
             self.head_dim,
         )
         with record_function("attn_kernel"):
-            if n_ctx <= 8:
+            if cache is not None and n_ctx == 1:
+                t = attention_decode(
+                    q,
+                    k,
+                    v,
+                    self.sinks,
+                    self.sm_scale,
+                    self.sliding_window,
+                    offset,
+                )
+            elif n_ctx <= 8:
                 t = attention_ref(
                     q,
                     k,
