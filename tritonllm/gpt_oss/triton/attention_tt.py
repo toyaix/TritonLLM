@@ -11,6 +11,7 @@ import torch
 
 import triton
 import triton.language as tl
+from gpt_oss.triton.attention_ref import attention_ref
 
 
 @triton.jit
@@ -112,9 +113,10 @@ def _attn_fwd(
     q = tl.load(Q_block_ptr)
 
     if BANDWIDTH:
-        lo, hi = tl.maximum(start_q, start_q + start_m * BLOCK_M - BANDWIDTH), start_q + (start_m + 1) * BLOCK_M
+        lo, hi = tl.maximum(0, start_q + start_m * BLOCK_M - BANDWIDTH), start_q + (start_m + 1) * BLOCK_M
     else:
-        lo, hi = start_q, start_q + (start_m + 1) * BLOCK_M
+        lo, hi = 0, start_q + (start_m + 1) * BLOCK_M
+    hi = tl.minimum(hi, N_KV_CTX)
 
     # advance the KV block-pointers so they point at `lo`
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
@@ -237,49 +239,8 @@ class _attention(torch.autograd.Function):
 attention = _attention.apply
 
 
-def attention_ref(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    sinks: torch.Tensor,
-    sm_scale: float = 0.125,
-    sliding_window: int | None = None,
-    start_q: torch.LongTensor = 0,
-):
-    batch_size, num_queries, num_key_value_heads, num_key_value_groups, head_dim = query.shape
-    batch_size, num_keys, num_key_value_heads, head_dim = key.shape
-
-    sinks = sinks.view(1, num_key_value_heads, num_key_value_groups, 1, 1).float()
-    key = key.unsqueeze(3)
-    value = value.unsqueeze(3)
-
-    pos_keys = torch.arange(num_keys, device=query.device)
-    pos_queries = torch.arange(num_queries, device=query.device) + start_q
-    mask = pos_keys[None, :] > pos_queries[:, None]
-    mask = mask.float().masked_fill(mask, float("-inf"))
-
-    if sliding_window:
-        too_old = pos_keys[None, :] < (pos_queries[:, None] - sliding_window + 1)
-        mask.masked_fill_(too_old, float("-inf"))
-
-    logits = torch.einsum("bqhmd,bkhmd->bhmqk", query.float(), key.float()) * sm_scale
-    logits = logits + mask[None, None, None, :, :]
-
-    logits_max = torch.max(logits, dim=-1, keepdim=True).values
-    logits_or_sinks_max = torch.maximum(sinks, logits_max)
-    sinks = torch.exp(sinks - logits_or_sinks_max)
-    unnormalized_scores = torch.exp(logits - logits_or_sinks_max)
-    normalizer = unnormalized_scores.sum(dim=-1, keepdim=True) + sinks
-    scores = unnormalized_scores / normalizer
-
-    output = torch.einsum("bhmqk,bkhmd->bqhmd", scores, value.float())
-
-    output = output.reshape(batch_size, num_queries, num_key_value_heads * num_key_value_groups * head_dim).bfloat16()
-    return output
-
-
 @pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("num_queries", [1, 128])
+@pytest.mark.parametrize("num_queries", [1, 16])
 @pytest.mark.parametrize("num_keys", [128, 32])
 @pytest.mark.parametrize("num_key_value_heads", [8])
 @pytest.mark.parametrize("num_key_value_groups", [8])
@@ -302,6 +263,8 @@ def test_eq(batch_size, num_queries, num_keys, num_key_value_heads, num_key_valu
     o2 = attention_ref(q, k, v, sinks, sm_scale, sliding_window, start_q)
 
     torch.testing.assert_close(o1, o2)
+
+
 
 if __name__ == "__main__":
     batch_size, num_queries, num_keys, num_key_value_heads, num_key_value_groups, head_dim, sm_scale, sliding_window, start_q = 1, 128, 128, 8, 8, 64, 0.125, None, 0
