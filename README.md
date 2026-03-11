@@ -26,6 +26,12 @@ You can install the latest stable release of Triton from pip:
 pip install tritonllm
 ```
 
+To enable the optional `triton_runner` JIT backend:
+
+```shell
+pip install "tritonllm[runner]"
+```
+
 ## 🚀 Command Line Interface (CLI)
 
 To quickly launch with the **gpt-oss-20b** model and automatically download it from ModelScope:
@@ -78,6 +84,22 @@ cd tritonllm
 
 pip install -e .
 ```
+
+Install the optional runner backend from source:
+
+```shell
+pip install -e ".[runner]"
+```
+
+## JIT backend selection
+
+By default the project keeps using `@triton.jit`. To switch the package-managed kernels to `@triton_runner.jit`, set:
+
+```shell
+export TRITONLLM_JIT_BACKEND=triton_runner
+```
+
+Supported values are `triton` and `triton_runner`. If `triton_runner` is selected without the optional dependency installed, the import will fail fast with a clear error.
 
 ## example code
 

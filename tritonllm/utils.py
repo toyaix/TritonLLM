@@ -2,6 +2,7 @@ import urllib.request
 import os
 import sys
 from tritonllm import gpt_oss, triton_kernels
+from tritonllm.jit_backend import configure_jit_backend
 from pathlib import Path
 from typing import Any, Optional, Union
 import tempfile
@@ -74,6 +75,7 @@ def get_model_with_checkpoint(checkpoint):
 
 
 def init_env():
+    configure_jit_backend()
     tritonllm_bin_dir = os.path.join(Path(gpt_oss.__file__).parent.parent, "bin")
 
     sys.modules['triton_kernels'] = triton_kernels

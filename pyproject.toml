@@ -43,6 +43,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 include-package-data = true
 
+[project.optional-dependencies]
+runner = [
+  "triton-runner>=0.3.5",
+]
+
 [tool.setuptools.package-data]
 "tritonllm" = ["*.txt", "README.md"]
 
