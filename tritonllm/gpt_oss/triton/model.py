@@ -460,7 +460,7 @@ class MLPBlock(torch.nn.Module):
             self.gate["bias"].detach().float().clone(),
             persistent=False,
         )
-        self._gate_bias_fp32_version = self.gate["bias"]._version
+        self._gate_bias_fp32_version = self._maybe_tensor_version(self.gate["bias"])
         self.mlp1_weight_tensor, self.mlp1_weight_mx = quantize_mx4(
             torch.empty(
                 (
@@ -485,7 +485,7 @@ class MLPBlock(torch.nn.Module):
             self.mlp1_bias.detach().float().clone(),
             persistent=False,
         )
-        self._mlp1_bias_fp32_version = self.mlp1_bias._version
+        self._mlp1_bias_fp32_version = self._maybe_tensor_version(self.mlp1_bias)
         self.mlp2_weight_tensor, self.mlp2_weight_mx = quantize_mx4(
             torch.empty(
                 (
@@ -510,9 +510,16 @@ class MLPBlock(torch.nn.Module):
             self.mlp2_bias.detach().float().clone(),
             persistent=False,
         )
-        self._mlp2_bias_fp32_version = self.mlp2_bias._version
+        self._mlp2_bias_fp32_version = self._maybe_tensor_version(self.mlp2_bias)
 
-    def _get_fp32_bias_cache(
+    @staticmethod
+    def _maybe_tensor_version(param: torch.Tensor) -> int | None:
+        try:
+            return param._version
+        except RuntimeError:
+            return None
+
+    def _refresh_fp32_bias_cache(
         self,
         param: torch.Tensor,
         cache_name: str,
@@ -522,12 +529,42 @@ class MLPBlock(torch.nn.Module):
         if cache.device != param.device or cache.shape != param.shape:
             cache = torch.empty_like(param, dtype=torch.float32, device=param.device)
             setattr(self, cache_name, cache)
-            setattr(self, version_name, -1)
+        cache.copy_(param.detach())
+        setattr(self, version_name, self._maybe_tensor_version(param))
+        return cache
 
-        version = param._version
+    def refresh_fp32_bias_caches(self) -> None:
+        self._refresh_fp32_bias_cache(
+            self.gate["bias"],
+            "gate_bias_fp32_cache",
+            "_gate_bias_fp32_version",
+        )
+        self._refresh_fp32_bias_cache(
+            self.mlp1_bias,
+            "mlp1_bias_fp32_cache",
+            "_mlp1_bias_fp32_version",
+        )
+        self._refresh_fp32_bias_cache(
+            self.mlp2_bias,
+            "mlp2_bias_fp32_cache",
+            "_mlp2_bias_fp32_version",
+        )
+
+    def _get_fp32_bias_cache(
+        self,
+        param: torch.Tensor,
+        cache_name: str,
+        version_name: str,
+    ) -> torch.Tensor:
+        cache = getattr(self, cache_name)
+        if cache.device != param.device or cache.shape != param.shape:
+            return self._refresh_fp32_bias_cache(param, cache_name, version_name)
+
+        version = self._maybe_tensor_version(param)
+        if version is None:
+            return cache
         if getattr(self, version_name) != version:
-            cache.copy_(param.detach())
-            setattr(self, version_name, version)
+            return self._refresh_fp32_bias_cache(param, cache_name, version_name)
         return cache
 
     def _get_gate_bias_fp32(self) -> torch.Tensor:
@@ -695,6 +732,9 @@ class Transformer(torch.nn.Module):
             else:
                 with torch.no_grad():
                     param.copy_(loaded_tensor)
+
+        for block in model.block:
+            block.mlp.refresh_fp32_bias_caches()
 
         # NOTE: Required to avoid OOM errors
         torch.cuda.empty_cache()
