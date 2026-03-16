@@ -18,7 +18,7 @@ else:
     from gpt_oss.triton.attention_tt_tma import attention
 
 from gpt_oss.triton.moe import quantize_mx4, moe
-from gpt_oss.triton.triton_kernels import rmsnorm_forward, rope_forward, unembedding_forward
+from gpt_oss.triton.triton_kernels import rmsnorm_forward, rope_forward, unembedding_decode_forward
 
 @dataclass
 class ModelConfig:
@@ -66,6 +66,14 @@ class UnEmbedding(torch.nn.Module):
 
     @record_function("unembedding_linear")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            x.is_cuda
+            and x.ndim == 3
+            and x.shape[1] == 1
+            and x.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+        ):
+            return unembedding_decode_forward(x, self.weight)
         return torch.nn.functional.linear(x, self.weight, bias=None)
 
 

@@ -105,54 +105,102 @@ def rope_forward(query, key, sin, cos, max_context_length, offset):
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_V": 64, "BLOCK_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_V": 128, "BLOCK_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_V": 128, "BLOCK_K": 256}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_V": 256, "BLOCK_K": 128}, num_warps=8, num_stages=2),
+    ],
+    key=["hidden_size"],
+)
 @triton.jit
-def matmul_bh_vh_kernel(
-    A_ptr, B_ptr, C_ptr,
-    B, V, H,
-    stride_am, stride_ah,
-    stride_bv, stride_bh,
-    stride_cb, stride_cv,
-    BLOCK_B: tl.constexpr, BLOCK_V: tl.constexpr, BLOCK_H: tl.constexpr,
+def unembedding_decode_kernel(
+    hidden_ptr,
+    weight_ptr,
+    logits_ptr,
+    vocab_size,
+    hidden_size,
+    stride_hidden_batch,
+    stride_hidden_dim,
+    stride_weight_vocab,
+    stride_weight_dim,
+    stride_logits_batch,
+    stride_logits_vocab,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
-    pid_b = tl.program_id(0)  # batch dim
-    pid_v = tl.program_id(1)  # vocab dim
+    pid_vocab = tl.program_id(0)
+    pid_batch = tl.program_id(1)
 
-    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
-    offs_v = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
-    offs_h = tl.arange(0, BLOCK_H)
+    offs_vocab = pid_vocab * BLOCK_V + tl.arange(0, BLOCK_V)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    acc = tl.zeros((BLOCK_B, BLOCK_V), dtype=tl.float32)
+    hidden_ptr = hidden_ptr + pid_batch.to(tl.int64) * stride_hidden_batch
+    logits_ptr = logits_ptr + pid_batch.to(tl.int64) * stride_logits_batch
 
-    for h in range(0, H, BLOCK_H):
-        # A: [B,H]
-        a_ptrs = A_ptr + (offs_b[:, None] * stride_am + (h + offs_h[None, :]) * stride_ah)
-        # B: [V,H] (need transpose to [H,V] when reading)
-        b_ptrs = B_ptr + (offs_v[None, :] * stride_bv + (h + offs_h[:, None]) * stride_bh)
+    acc = tl.zeros((BLOCK_V, 1), dtype=tl.float32)
 
-        a = tl.load(a_ptrs, mask=(offs_b[:, None] < B) & (h + offs_h[None, :] < H), other=0.)
-        b = tl.load(b_ptrs, mask=(offs_v[None, :] < V) & (h + offs_h[:, None] < H), other=0.)
+    for k_start in range(0, hidden_size, BLOCK_K):
+        k_offsets = k_start + offs_k
+        hidden = tl.load(
+            hidden_ptr + k_offsets.to(tl.int64) * stride_hidden_dim,
+            mask=k_offsets < hidden_size,
+            other=0,
+        )
+        weight = tl.load(
+            weight_ptr
+            + offs_vocab[:, None].to(tl.int64) * stride_weight_vocab
+            + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
+            mask=(offs_vocab[:, None] < vocab_size) & (k_offsets[None, :] < hidden_size),
+            other=0,
+        )
+        acc += tl.dot(weight, hidden[:, None])
 
-        acc += tl.dot(a, b)
+    tl.store(
+        logits_ptr + offs_vocab.to(tl.int64) * stride_logits_vocab,
+        acc[:, 0].to(logits_ptr.type.element_ty),
+        mask=offs_vocab < vocab_size,
+    )
 
-    # Write C: [B,V]
-    c_ptrs = C_ptr + offs_b[:, None] * stride_cb + offs_v[None, :] * stride_cv
-    tl.store(c_ptrs, acc.to(tl.bfloat16), mask=(offs_b[:, None] < B) & (offs_v[None, :] < V))
+
+def unembedding_decode_forward(hidden, weight):
+    batch, num_tokens, hidden_size = hidden.shape
+    vocab_size, hidden_size_weight = weight.shape
+    assert num_tokens == 1
+    assert hidden_size == hidden_size_weight
+
+    hidden = hidden.reshape(batch, hidden_size)
+    if hidden.stride(-1) != 1:
+        hidden = hidden.contiguous()
+    if weight.stride(-1) != 1:
+        weight = weight.contiguous()
+
+    logits = torch.empty((batch, vocab_size), device=hidden.device, dtype=hidden.dtype)
+    grid = lambda META: (triton.cdiv(vocab_size, META["BLOCK_V"]), batch)
+    unembedding_decode_kernel[grid](
+        hidden,
+        weight,
+        logits,
+        vocab_size,
+        hidden_size,
+        hidden.stride(0),
+        hidden.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        logits.stride(0),
+        logits.stride(1),
+    )
+    return logits[:, None, :]
 
 
 def unembedding_forward(hidden, weight):
-    batch, num_tokens, hidden_size = hidden.shape
-    vocab_size, hidden_size = weight.shape
-
-    logits = torch.empty((batch, num_tokens, vocab_size), device=hidden.device, dtype=torch.bfloat16)
-    BLOCK_B, BLOCK_V, BLOCK_H = 16, 16, 256
-    grid = (triton.cdiv(num_tokens, BLOCK_B), triton.cdiv(vocab_size, BLOCK_V), batch)
-
-    matmul_bh_vh_kernel[grid](
-        hidden, weight, logits,
-        num_tokens, vocab_size, hidden_size,
-        hidden_size, 1,
-        hidden_size, 1,
-        vocab_size, 1,
-        BLOCK_B=BLOCK_B, BLOCK_V=BLOCK_V, BLOCK_H=BLOCK_H,
-    )
-    return logits
+    if (
+        hidden.is_cuda
+        and hidden.ndim == 3
+        and hidden.shape[1] == 1
+        and hidden.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+    ):
+        return unembedding_decode_forward(hidden, weight)
+    return torch.nn.functional.linear(hidden, weight, bias=None)
