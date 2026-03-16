@@ -394,9 +394,9 @@ def qkv_rope_cache_decode_kernel(
     pid_batch = tl.program_id(1)
 
     offs_k = tl.arange(0, BLOCK_K)
-    offs_d = tl.arange(0, HEAD_DIM)
     offs_half = tl.arange(0, HEAD_DIM // 2)
 
+    total_heads = num_q_heads + 2 * num_kv_heads
     q_dim = num_q_heads * HEAD_DIM
     kv_dim = num_kv_heads * HEAD_DIM
 
@@ -417,11 +417,14 @@ def qkv_rope_cache_decode_kernel(
             q_dim + kv_dim + v_head * HEAD_DIM,
         ),
     )
-    out_offsets = out_base + offs_d
-    out_mask = out_offsets < total_heads * HEAD_DIM
+    out_offsets_lo = out_base + offs_half
+    out_offsets_hi = out_base + HEAD_DIM // 2 + offs_half
+    out_mask_lo = out_offsets_lo < total_heads * HEAD_DIM
+    out_mask_hi = out_offsets_hi < total_heads * HEAD_DIM
 
     hidden_ptr = hidden_ptr + pid_batch.to(tl.int64) * stride_hidden_batch
-    acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+    acc_lo = tl.zeros((HEAD_DIM // 2,), dtype=tl.float32)
+    acc_hi = tl.zeros((HEAD_DIM // 2,), dtype=tl.float32)
 
     for k_start in range(0, hidden_size, BLOCK_K):
         k_offsets = k_start + offs_k
@@ -430,40 +433,50 @@ def qkv_rope_cache_decode_kernel(
             mask=k_offsets < hidden_size,
             other=0,
         )
-        weight = tl.load(
+        weight_lo = tl.load(
             weight_ptr
-            + out_offsets[:, None].to(tl.int64) * stride_weight_out
+            + out_offsets_lo[:, None].to(tl.int64) * stride_weight_out
             + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
-            mask=out_mask[:, None] & (k_offsets[None, :] < hidden_size),
+            mask=out_mask_lo[:, None] & (k_offsets[None, :] < hidden_size),
             other=0,
         )
-        acc += tl.sum(weight * hidden[None, :], axis=1)
+        weight_hi = tl.load(
+            weight_ptr
+            + out_offsets_hi[:, None].to(tl.int64) * stride_weight_out
+            + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
+            mask=out_mask_hi[:, None] & (k_offsets[None, :] < hidden_size),
+            other=0,
+        )
+        acc_lo += tl.sum(weight_lo * hidden[None, :], axis=1)
+        acc_hi += tl.sum(weight_hi * hidden[None, :], axis=1)
 
-    bias = tl.load(
-        bias_ptr + out_offsets.to(tl.int64) * stride_bias_out,
-        mask=out_mask,
+    bias_lo = tl.load(
+        bias_ptr + out_offsets_lo.to(tl.int64) * stride_bias_out,
+        mask=out_mask_lo,
         other=0,
     )
-    acc += bias.to(tl.float32)
+    bias_hi = tl.load(
+        bias_ptr + out_offsets_hi.to(tl.int64) * stride_bias_out,
+        mask=out_mask_hi,
+        other=0,
+    )
+    acc_lo += bias_lo.to(tl.float32)
+    acc_hi += bias_hi.to(tl.float32)
 
     raw_offset = tl.load(offset_ptr).to(tl.int64)
     rope_offset = raw_offset % max_context_length
     sin = tl.load(
-        sin_ptr + rope_offset * stride_sin_ctx + offs_half.to(tl.int64) * stride_sin_dim,
-        other=0,
+        sin_ptr + rope_offset * stride_sin_ctx + offs_half.to(tl.int64) * stride_sin_dim
     ).to(tl.float32)
     cos = tl.load(
-        cos_ptr + rope_offset * stride_cos_ctx + offs_half.to(tl.int64) * stride_cos_dim,
-        other=0,
+        cos_ptr + rope_offset * stride_cos_ctx + offs_half.to(tl.int64) * stride_cos_dim
     ).to(tl.float32)
-    acc_lo = acc[: HEAD_DIM // 2]
-    acc_hi = acc[HEAD_DIM // 2 :]
     rot_lo = acc_lo * cos - acc_hi * sin
     rot_hi = acc_hi * cos + acc_lo * sin
 
     q_mask = is_q & (offs_half < HEAD_DIM // 2)
     k_mask = is_k & (offs_half < HEAD_DIM // 2)
-    v_mask = is_v & (offs_d < HEAD_DIM)
+    v_mask = is_v & (offs_half < HEAD_DIM // 2)
 
     q_ptr = q_ptr + pid_batch.to(tl.int64) * stride_q_batch + q_head.to(tl.int64) * stride_q_head
     tl.store(
@@ -501,8 +514,13 @@ def qkv_rope_cache_decode_kernel(
         + v_head.to(tl.int64) * stride_v_head
     )
     tl.store(
-        v_cache_ptr + offs_d.to(tl.int64) * stride_v_dim,
-        acc.to(v_cache_ptr.type.element_ty),
+        v_cache_ptr + offs_half.to(tl.int64) * stride_v_dim,
+        acc_lo.to(v_cache_ptr.type.element_ty),
+        mask=v_mask,
+    )
+    tl.store(
+        v_cache_ptr + (HEAD_DIM // 2 + offs_half).to(tl.int64) * stride_v_dim,
+        acc_hi.to(v_cache_ptr.type.element_ty),
         mask=v_mask,
     )
 
