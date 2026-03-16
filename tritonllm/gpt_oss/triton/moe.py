@@ -6,7 +6,7 @@ from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
 from triton_kernels.matmul_ogs import PrecisionConfig, FlexCtx, FnSpecs, FusedActivation
 from triton_kernels.matmul_ogs import matmul_ogs
 from triton_kernels.numerics import InFlexData
-from triton_kernels.routing import routing, routing_torch
+from triton_kernels.routing import routing
 from triton_kernels.tensor import convert_layout
 from triton_kernels.tensor_details.layout import StridedLayout, make_default_matmul_mxfp4_w_layout
 from triton_kernels.tensor import wrap_torch_tensor, FP4
@@ -88,7 +88,14 @@ def moe_decode(
             logits = logits + bg
     with record_function("routing_decode"):
         expt_indx = torch.topk(logits, experts_per_token, dim=1, sorted=False).indices.to(torch.int32)
-        rdata, gather_indx, scatter_indx = routing_torch(logits, experts_per_token, expt_indx=expt_indx)
+        # Keep decode routing graph-safe by reusing the Triton routing backend for
+        # sorting/packing while still skipping its streaming top-k search.
+        rdata, gather_indx, scatter_indx = routing(
+            logits,
+            experts_per_token,
+            expt_indx=expt_indx,
+            simulated_ep=1,
+        )
 
     if fused_act:
         assert interleaved, "Fused activation requires interleaved weights"
