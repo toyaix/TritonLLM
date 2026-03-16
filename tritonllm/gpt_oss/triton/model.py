@@ -19,6 +19,7 @@ else:
 
 from gpt_oss.triton.moe import quantize_mx4, moe
 from gpt_oss.triton.triton_kernels import (
+    out_residual_decode_forward,
     qkv_rope_cache_decode_forward,
     qkv_decode_forward,
     rmsnorm_forward,
@@ -136,6 +137,21 @@ class OUT(torch.nn.Module):
     @record_function("out_linear")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.linear(x, self.weight, self.bias)
+
+    @record_function("out_linear_decode")
+    def decode_residual(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        if (
+            x.is_cuda
+            and x.ndim == 3
+            and x.shape[1] == 1
+            and x.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+            and self.bias.dtype == torch.bfloat16
+            and residual.shape == (x.shape[0], 1, self.weight.shape[0])
+            and residual.dtype == torch.bfloat16
+        ):
+            return out_residual_decode_forward(x, self.weight, self.bias, residual)
+        return self.forward(x) + residual
 
 
 class RotaryEmbedding(torch.nn.Module):
@@ -402,8 +418,11 @@ class AttentionBlock(torch.nn.Module):
                 )
 
         with record_function("c_proj"):
-            t = self.out(t)
-        t = x + t
+            if fused_decode:
+                t = self.out.decode_residual(t, x)
+            else:
+                t = self.out(t)
+                t = x + t
         return t
 
 

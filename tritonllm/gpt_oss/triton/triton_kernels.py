@@ -604,3 +604,124 @@ def qkv_rope_cache_decode_forward(
         HEAD_DIM=head_dim,
     )
     return q.reshape(batch, 1, num_q_heads * head_dim)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_OUT": 64, "BLOCK_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_OUT": 128, "BLOCK_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_OUT": 128, "BLOCK_K": 256}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_OUT": 256, "BLOCK_K": 128}, num_warps=8, num_stages=2),
+    ],
+    key=["hidden_size", "out_dim"],
+)
+@triton.jit
+def out_residual_decode_kernel(
+    hidden_ptr,
+    weight_ptr,
+    bias_ptr,
+    residual_ptr,
+    out_ptr,
+    hidden_size,
+    out_dim,
+    stride_hidden_batch,
+    stride_hidden_dim,
+    stride_weight_out,
+    stride_weight_dim,
+    stride_bias_dim,
+    stride_residual_batch,
+    stride_residual_dim,
+    stride_out_batch,
+    stride_out_dim,
+    BLOCK_OUT: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_out = tl.program_id(0)
+    pid_batch = tl.program_id(1)
+
+    offs_out = pid_out * BLOCK_OUT + tl.arange(0, BLOCK_OUT)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    hidden_ptr = hidden_ptr + pid_batch.to(tl.int64) * stride_hidden_batch
+    residual_ptr = residual_ptr + pid_batch.to(tl.int64) * stride_residual_batch
+    out_ptr = out_ptr + pid_batch.to(tl.int64) * stride_out_batch
+
+    acc = tl.zeros((BLOCK_OUT,), dtype=tl.float32)
+    out_mask = offs_out < hidden_size
+
+    for k_start in range(0, out_dim, BLOCK_K):
+        k_offsets = k_start + offs_k
+        hidden = tl.load(
+            hidden_ptr + k_offsets.to(tl.int64) * stride_hidden_dim,
+            mask=k_offsets < out_dim,
+            other=0,
+        )
+        weight = tl.load(
+            weight_ptr
+            + offs_out[:, None].to(tl.int64) * stride_weight_out
+            + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
+            mask=out_mask[:, None] & (k_offsets[None, :] < out_dim),
+            other=0,
+        )
+        acc += tl.sum(weight * hidden[None, :], axis=1)
+
+    bias = tl.load(
+        bias_ptr + offs_out.to(tl.int64) * stride_bias_dim,
+        mask=out_mask,
+        other=0,
+    )
+    residual = tl.load(
+        residual_ptr + offs_out.to(tl.int64) * stride_residual_dim,
+        mask=out_mask,
+        other=0,
+    )
+    acc += bias.to(tl.float32) + residual.to(tl.float32)
+
+    tl.store(
+        out_ptr + offs_out.to(tl.int64) * stride_out_dim,
+        acc.to(out_ptr.type.element_ty),
+        mask=out_mask,
+    )
+
+
+def out_residual_decode_forward(hidden, weight, bias, residual):
+    batch, num_tokens, out_dim_hidden = hidden.shape
+    hidden_size, out_dim_weight = weight.shape
+
+    assert num_tokens == 1
+    assert out_dim_hidden == out_dim_weight
+    assert bias.shape == (hidden_size,)
+    assert residual.shape == (batch, 1, hidden_size)
+
+    hidden = hidden.reshape(batch, out_dim_hidden)
+    residual = residual.reshape(batch, hidden_size)
+    if hidden.stride(-1) != 1:
+        hidden = hidden.contiguous()
+    if weight.stride(-1) != 1:
+        weight = weight.contiguous()
+    if bias.stride(0) != 1:
+        bias = bias.contiguous()
+    if residual.stride(-1) != 1:
+        residual = residual.contiguous()
+
+    out = torch.empty((batch, hidden_size), device=hidden.device, dtype=hidden.dtype)
+    grid = lambda META: (triton.cdiv(hidden_size, META["BLOCK_OUT"]), batch)
+    out_residual_decode_kernel[grid](
+        hidden,
+        weight,
+        bias,
+        residual,
+        out,
+        hidden_size,
+        out_dim_hidden,
+        hidden.stride(0),
+        hidden.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        bias.stride(0),
+        residual.stride(0),
+        residual.stride(1),
+        out.stride(0),
+        out.stride(1),
+    )
+    return out[:, None, :]
