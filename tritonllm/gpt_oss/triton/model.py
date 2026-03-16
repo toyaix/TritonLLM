@@ -19,6 +19,7 @@ else:
 
 from gpt_oss.triton.moe import quantize_mx4, moe
 from gpt_oss.triton.triton_kernels import (
+    qkv_rope_cache_decode_forward,
     qkv_decode_forward,
     rmsnorm_forward,
     rope_forward,
@@ -314,8 +315,29 @@ class AttentionBlock(torch.nn.Module):
         with record_function("qkv"):
             q_dim = self.num_attention_heads * self.head_dim
             kv_dim = self.num_key_value_heads * self.head_dim
-            if cache is not None and n_ctx == 1:
-                q, k, v = self.qkv.decode(t, q_dim, kv_dim)
+            if (
+                cache is not None
+                and n_ctx == 1
+                and t.is_cuda
+                and t.dtype == torch.bfloat16
+            ):
+                offset = cache.offset.clone()
+                q = qkv_rope_cache_decode_forward(
+                    t,
+                    self.qkv.weight,
+                    self.qkv.bias,
+                    self.rope.sin,
+                    self.rope.cos,
+                    self.rope.max_context_length,
+                    cache.k,
+                    cache.v,
+                    offset,
+                    self.num_attention_heads,
+                    self.num_key_value_heads,
+                    self.head_dim,
+                )
+                cache.offset.add_(1)
+                k, v = cache.k, cache.v
             else:
                 qkv = self.qkv(t)
                 q, k, v = torch.split(qkv, (q_dim, kv_dim, kv_dim), dim=-1)
@@ -325,7 +347,9 @@ class AttentionBlock(torch.nn.Module):
         k = k.view(batch_size, n_ctx, self.num_key_value_heads, self.head_dim)
         v = v.view(batch_size, n_ctx, self.num_key_value_heads, self.head_dim)
 
-        if cache is not None:
+        if cache is not None and n_ctx == 1 and t.is_cuda and t.dtype == torch.bfloat16:
+            pass
+        elif cache is not None:
             offset = cache.offset.clone()
             q, k = self.rope(q, k, offset=offset)
             k, v = cache.extend(k, v)

@@ -343,3 +343,243 @@ def qkv_decode_forward(hidden, weight, bias, q_dim, kv_dim):
         v.stride(1),
     )
     return q[:, None, :], k[:, None, :], v[:, None, :]
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_K": 256}, num_warps=8, num_stages=2),
+    ],
+    key=["hidden_size", "num_q_heads", "num_kv_heads"],
+)
+@triton.jit
+def qkv_rope_cache_decode_kernel(
+    hidden_ptr,
+    weight_ptr,
+    bias_ptr,
+    sin_ptr,
+    cos_ptr,
+    offset_ptr,
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    hidden_size,
+    num_q_heads,
+    num_kv_heads,
+    stride_hidden_batch,
+    stride_hidden_dim,
+    stride_weight_out,
+    stride_weight_dim,
+    stride_bias_out,
+    stride_sin_ctx,
+    stride_sin_dim,
+    stride_cos_ctx,
+    stride_cos_dim,
+    stride_q_batch,
+    stride_q_head,
+    stride_q_dim,
+    stride_k_batch,
+    stride_k_ctx,
+    stride_k_head,
+    stride_k_dim,
+    stride_v_batch,
+    stride_v_ctx,
+    stride_v_head,
+    stride_v_dim,
+    max_context_length,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_head = tl.program_id(0)
+    pid_batch = tl.program_id(1)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, HEAD_DIM)
+    offs_half = tl.arange(0, HEAD_DIM // 2)
+
+    q_dim = num_q_heads * HEAD_DIM
+    kv_dim = num_kv_heads * HEAD_DIM
+
+    is_q = pid_head < num_q_heads
+    is_k = (pid_head >= num_q_heads) & (pid_head < num_q_heads + num_kv_heads)
+    is_v = pid_head >= num_q_heads + num_kv_heads
+
+    q_head = tl.where(is_q, pid_head, 0)
+    k_head = tl.where(is_k, pid_head - num_q_heads, 0)
+    v_head = tl.where(is_v, pid_head - num_q_heads - num_kv_heads, 0)
+
+    out_base = tl.where(
+        is_q,
+        q_head * HEAD_DIM,
+        tl.where(
+            is_k,
+            q_dim + k_head * HEAD_DIM,
+            q_dim + kv_dim + v_head * HEAD_DIM,
+        ),
+    )
+
+    hidden_ptr = hidden_ptr + pid_batch.to(tl.int64) * stride_hidden_batch
+    acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+
+    for k_start in range(0, hidden_size, BLOCK_K):
+        k_offsets = k_start + offs_k
+        hidden = tl.load(
+            hidden_ptr + k_offsets.to(tl.int64) * stride_hidden_dim,
+            mask=k_offsets < hidden_size,
+            other=0,
+        )
+        weight = tl.load(
+            weight_ptr
+            + (out_base + offs_d)[:, None].to(tl.int64) * stride_weight_out
+            + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
+            mask=k_offsets[None, :] < hidden_size,
+            other=0,
+        )
+        acc += tl.sum(weight * hidden[None, :], axis=1)
+
+    bias = tl.load(
+        bias_ptr + (out_base + offs_d).to(tl.int64) * stride_bias_out,
+        other=0,
+    )
+    acc += bias.to(tl.float32)
+
+    raw_offset = tl.load(offset_ptr).to(tl.int64)
+    rope_offset = raw_offset % max_context_length
+    sin = tl.load(
+        sin_ptr + rope_offset * stride_sin_ctx + offs_half.to(tl.int64) * stride_sin_dim,
+        other=0,
+    ).to(tl.float32)
+    cos = tl.load(
+        cos_ptr + rope_offset * stride_cos_ctx + offs_half.to(tl.int64) * stride_cos_dim,
+        other=0,
+    ).to(tl.float32)
+    acc_lo = acc[: HEAD_DIM // 2]
+    acc_hi = acc[HEAD_DIM // 2 :]
+    rot_lo = acc_lo * cos - acc_hi * sin
+    rot_hi = acc_hi * cos + acc_lo * sin
+
+    q_mask = is_q & (offs_half < HEAD_DIM // 2)
+    k_mask = is_k & (offs_half < HEAD_DIM // 2)
+    v_mask = is_v & (offs_d < HEAD_DIM)
+
+    q_ptr = q_ptr + pid_batch.to(tl.int64) * stride_q_batch + q_head.to(tl.int64) * stride_q_head
+    tl.store(
+        q_ptr + offs_half.to(tl.int64) * stride_q_dim,
+        rot_lo.to(q_ptr.type.element_ty),
+        mask=q_mask,
+    )
+    tl.store(
+        q_ptr + (HEAD_DIM // 2 + offs_half).to(tl.int64) * stride_q_dim,
+        rot_hi.to(q_ptr.type.element_ty),
+        mask=q_mask,
+    )
+
+    k_cache_ptr = (
+        k_cache_ptr
+        + pid_batch.to(tl.int64) * stride_k_batch
+        + raw_offset * stride_k_ctx
+        + k_head.to(tl.int64) * stride_k_head
+    )
+    tl.store(
+        k_cache_ptr + offs_half.to(tl.int64) * stride_k_dim,
+        rot_lo.to(k_cache_ptr.type.element_ty),
+        mask=k_mask,
+    )
+    tl.store(
+        k_cache_ptr + (HEAD_DIM // 2 + offs_half).to(tl.int64) * stride_k_dim,
+        rot_hi.to(k_cache_ptr.type.element_ty),
+        mask=k_mask,
+    )
+
+    v_cache_ptr = (
+        v_cache_ptr
+        + pid_batch.to(tl.int64) * stride_v_batch
+        + raw_offset * stride_v_ctx
+        + v_head.to(tl.int64) * stride_v_head
+    )
+    tl.store(
+        v_cache_ptr + offs_d.to(tl.int64) * stride_v_dim,
+        acc.to(v_cache_ptr.type.element_ty),
+        mask=v_mask,
+    )
+
+
+def qkv_rope_cache_decode_forward(
+    hidden,
+    weight,
+    bias,
+    sin,
+    cos,
+    max_context_length,
+    cache_k,
+    cache_v,
+    offset,
+    num_q_heads,
+    num_kv_heads,
+    head_dim,
+):
+    batch, num_tokens, hidden_size = hidden.shape
+    total_out, hidden_size_weight = weight.shape
+
+    assert num_tokens == 1
+    assert hidden_size == hidden_size_weight
+    assert total_out == (num_q_heads + 2 * num_kv_heads) * head_dim
+    assert bias.shape == (total_out,)
+    assert cache_k.shape == cache_v.shape
+    assert cache_k.shape[0] == batch
+    assert cache_k.shape[2] == num_kv_heads
+    assert cache_k.shape[3] == head_dim
+    assert offset.shape == (1,)
+
+    hidden = hidden.reshape(batch, hidden_size)
+    if hidden.stride(-1) != 1:
+        hidden = hidden.contiguous()
+    if weight.stride(-1) != 1:
+        weight = weight.contiguous()
+    if bias.stride(0) != 1:
+        bias = bias.contiguous()
+    if sin.stride(-1) != 1:
+        sin = sin.contiguous()
+    if cos.stride(-1) != 1:
+        cos = cos.contiguous()
+
+    q = torch.empty((batch, num_q_heads, head_dim), device=hidden.device, dtype=hidden.dtype)
+
+    grid = (num_q_heads + 2 * num_kv_heads, batch)
+    qkv_rope_cache_decode_kernel[grid](
+        hidden,
+        weight,
+        bias,
+        sin,
+        cos,
+        offset,
+        q,
+        cache_k,
+        cache_v,
+        hidden_size,
+        num_q_heads,
+        num_kv_heads,
+        hidden.stride(0),
+        hidden.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        bias.stride(0),
+        sin.stride(0),
+        sin.stride(1),
+        cos.stride(0),
+        cos.stride(1),
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        cache_k.stride(0),
+        cache_k.stride(1),
+        cache_k.stride(2),
+        cache_k.stride(3),
+        cache_v.stride(0),
+        cache_v.stride(1),
+        cache_v.stride(2),
+        cache_v.stride(3),
+        max_context_length,
+        HEAD_DIM=head_dim,
+    )
+    return q.reshape(batch, 1, num_q_heads * head_dim)
