@@ -204,3 +204,142 @@ def unembedding_forward(hidden, weight):
     ):
         return unembedding_decode_forward(hidden, weight)
     return torch.nn.functional.linear(hidden, weight, bias=None)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_OUT": 64, "BLOCK_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_OUT": 128, "BLOCK_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_OUT": 128, "BLOCK_K": 256}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_OUT": 256, "BLOCK_K": 128}, num_warps=8, num_stages=2),
+    ],
+    key=["hidden_size", "q_dim", "kv_dim"],
+)
+@triton.jit
+def qkv_decode_kernel(
+    hidden_ptr,
+    weight_ptr,
+    bias_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    hidden_size,
+    q_dim,
+    kv_dim,
+    stride_hidden_batch,
+    stride_hidden_dim,
+    stride_weight_out,
+    stride_weight_dim,
+    stride_bias_out,
+    stride_q_batch,
+    stride_q_dim,
+    stride_k_batch,
+    stride_k_dim,
+    stride_v_batch,
+    stride_v_dim,
+    BLOCK_OUT: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_out = tl.program_id(0)
+    pid_batch = tl.program_id(1)
+
+    total_out = q_dim + kv_dim + kv_dim
+    offs_out = pid_out * BLOCK_OUT + tl.arange(0, BLOCK_OUT)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    hidden_ptr = hidden_ptr + pid_batch.to(tl.int64) * stride_hidden_batch
+    acc = tl.zeros((BLOCK_OUT,), dtype=tl.float32)
+
+    for k_start in range(0, hidden_size, BLOCK_K):
+        k_offsets = k_start + offs_k
+        hidden = tl.load(
+            hidden_ptr + k_offsets.to(tl.int64) * stride_hidden_dim,
+            mask=k_offsets < hidden_size,
+            other=0,
+        )
+        weight = tl.load(
+            weight_ptr
+            + offs_out[:, None].to(tl.int64) * stride_weight_out
+            + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
+            mask=(offs_out[:, None] < total_out) & (k_offsets[None, :] < hidden_size),
+            other=0,
+        )
+        acc += tl.sum(weight * hidden[None, :], axis=1)
+
+    bias = tl.load(
+        bias_ptr + offs_out.to(tl.int64) * stride_bias_out,
+        mask=offs_out < total_out,
+        other=0,
+    )
+    acc += bias.to(tl.float32)
+
+    q_mask = offs_out < q_dim
+    k_mask = (offs_out >= q_dim) & (offs_out < q_dim + kv_dim)
+    v_mask = (offs_out >= q_dim + kv_dim) & (offs_out < total_out)
+
+    q_offsets = tl.where(q_mask, offs_out, 0)
+    k_offsets = tl.where(k_mask, offs_out - q_dim, 0)
+    v_offsets = tl.where(v_mask, offs_out - q_dim - kv_dim, 0)
+
+    tl.store(
+        q_ptr + pid_batch.to(tl.int64) * stride_q_batch + q_offsets.to(tl.int64) * stride_q_dim,
+        acc.to(q_ptr.type.element_ty),
+        mask=q_mask,
+    )
+    tl.store(
+        k_ptr + pid_batch.to(tl.int64) * stride_k_batch + k_offsets.to(tl.int64) * stride_k_dim,
+        acc.to(k_ptr.type.element_ty),
+        mask=k_mask,
+    )
+    tl.store(
+        v_ptr + pid_batch.to(tl.int64) * stride_v_batch + v_offsets.to(tl.int64) * stride_v_dim,
+        acc.to(v_ptr.type.element_ty),
+        mask=v_mask,
+    )
+
+
+def qkv_decode_forward(hidden, weight, bias, q_dim, kv_dim):
+    batch, num_tokens, hidden_size = hidden.shape
+    total_out, hidden_size_weight = weight.shape
+
+    assert num_tokens == 1
+    assert hidden_size == hidden_size_weight
+    assert bias.shape == (total_out,)
+    assert total_out == q_dim + 2 * kv_dim
+
+    hidden = hidden.reshape(batch, hidden_size)
+    if hidden.stride(-1) != 1:
+        hidden = hidden.contiguous()
+    if weight.stride(-1) != 1:
+        weight = weight.contiguous()
+    if bias.stride(0) != 1:
+        bias = bias.contiguous()
+
+    q = torch.empty((batch, q_dim), device=hidden.device, dtype=hidden.dtype)
+    k = torch.empty((batch, kv_dim), device=hidden.device, dtype=hidden.dtype)
+    v = torch.empty((batch, kv_dim), device=hidden.device, dtype=hidden.dtype)
+
+    grid = lambda META: (triton.cdiv(total_out, META["BLOCK_OUT"]), batch)
+    qkv_decode_kernel[grid](
+        hidden,
+        weight,
+        bias,
+        q,
+        k,
+        v,
+        hidden_size,
+        q_dim,
+        kv_dim,
+        hidden.stride(0),
+        hidden.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        bias.stride(0),
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+    )
+    return q[:, None, :], k[:, None, :], v[:, None, :]

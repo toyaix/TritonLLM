@@ -18,7 +18,12 @@ else:
     from gpt_oss.triton.attention_tt_tma import attention
 
 from gpt_oss.triton.moe import quantize_mx4, moe
-from gpt_oss.triton.triton_kernels import rmsnorm_forward, rope_forward, unembedding_decode_forward
+from gpt_oss.triton.triton_kernels import (
+    qkv_decode_forward,
+    rmsnorm_forward,
+    rope_forward,
+    unembedding_decode_forward,
+)
 
 @dataclass
 class ModelConfig:
@@ -92,6 +97,27 @@ class QKV(torch.nn.Module):
     @record_function("qkv_linear")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.linear(x, self.weight, self.bias)
+
+    @record_function("qkv_linear_decode")
+    def decode(
+        self,
+        x: torch.Tensor,
+        q_dim: int,
+        kv_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if (
+            x.is_cuda
+            and x.ndim == 3
+            and x.shape[1] == 1
+            and x.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+            and self.bias.dtype == torch.bfloat16
+        ):
+            return qkv_decode_forward(x, self.weight, self.bias, q_dim, kv_dim)
+
+        qkv = self.forward(x)
+        q, k, v = torch.split(qkv, (q_dim, kv_dim, kv_dim), dim=-1)
+        return q.contiguous(), k.contiguous(), v.contiguous()
 
 
 class OUT(torch.nn.Module):
@@ -286,14 +312,14 @@ class AttentionBlock(torch.nn.Module):
 
         t = self.norm(x)
         with record_function("qkv"):
-            qkv = self.qkv(t)
-            qkv_parts = (
-                self.num_attention_heads * self.head_dim,
-                self.num_key_value_heads * self.head_dim,
-                self.num_key_value_heads * self.head_dim
-            )
-            q, k, v = torch.split(qkv, qkv_parts, dim=-1)
-            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+            q_dim = self.num_attention_heads * self.head_dim
+            kv_dim = self.num_key_value_heads * self.head_dim
+            if cache is not None and n_ctx == 1:
+                q, k, v = self.qkv.decode(t, q_dim, kv_dim)
+            else:
+                qkv = self.qkv(t)
+                q, k, v = torch.split(qkv, (q_dim, kv_dim, kv_dim), dim=-1)
+                q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
         q = q.view(batch_size, n_ctx, self.num_attention_heads, self.head_dim)
         k = k.view(batch_size, n_ctx, self.num_key_value_heads, self.head_dim)
