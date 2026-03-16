@@ -139,7 +139,7 @@ def unembedding_decode_kernel(
     hidden_ptr = hidden_ptr + pid_batch.to(tl.int64) * stride_hidden_batch
     logits_ptr = logits_ptr + pid_batch.to(tl.int64) * stride_logits_batch
 
-    acc = tl.zeros((BLOCK_V, 1), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_V,), dtype=tl.float32)
 
     for k_start in range(0, hidden_size, BLOCK_K):
         k_offsets = k_start + offs_k
@@ -155,11 +155,11 @@ def unembedding_decode_kernel(
             mask=(offs_vocab[:, None] < vocab_size) & (k_offsets[None, :] < hidden_size),
             other=0,
         )
-        acc += tl.dot(weight, hidden[:, None])
+        acc += tl.sum(weight * hidden[None, :], axis=1)
 
     tl.store(
         logits_ptr + offs_vocab.to(tl.int64) * stride_logits_vocab,
-        acc[:, 0].to(logits_ptr.type.element_ty),
+        acc.to(logits_ptr.type.element_ty),
         mask=offs_vocab < vocab_size,
     )
 
