@@ -455,6 +455,12 @@ class MLPBlock(torch.nn.Module):
                 )
             ),
         })
+        self.register_buffer(
+            "gate_bias_fp32_cache",
+            self.gate["bias"].detach().float().clone(),
+            persistent=False,
+        )
+        self._gate_bias_fp32_version = self.gate["bias"]._version
         self.mlp1_weight_tensor, self.mlp1_weight_mx = quantize_mx4(
             torch.empty(
                 (
@@ -474,6 +480,12 @@ class MLPBlock(torch.nn.Module):
                 dtype=torch.bfloat16,
             )
         )
+        self.register_buffer(
+            "mlp1_bias_fp32_cache",
+            self.mlp1_bias.detach().float().clone(),
+            persistent=False,
+        )
+        self._mlp1_bias_fp32_version = self.mlp1_bias._version
         self.mlp2_weight_tensor, self.mlp2_weight_mx = quantize_mx4(
             torch.empty(
                 (
@@ -493,11 +505,59 @@ class MLPBlock(torch.nn.Module):
                 dtype=torch.bfloat16,
             )
         )
+        self.register_buffer(
+            "mlp2_bias_fp32_cache",
+            self.mlp2_bias.detach().float().clone(),
+            persistent=False,
+        )
+        self._mlp2_bias_fp32_version = self.mlp2_bias._version
+
+    def _get_fp32_bias_cache(
+        self,
+        param: torch.Tensor,
+        cache_name: str,
+        version_name: str,
+    ) -> torch.Tensor:
+        cache = getattr(self, cache_name)
+        if cache.device != param.device or cache.shape != param.shape:
+            cache = torch.empty_like(param, dtype=torch.float32, device=param.device)
+            setattr(self, cache_name, cache)
+            setattr(self, version_name, -1)
+
+        version = param._version
+        if getattr(self, version_name) != version:
+            cache.copy_(param.detach())
+            setattr(self, version_name, version)
+        return cache
+
+    def _get_gate_bias_fp32(self) -> torch.Tensor:
+        return self._get_fp32_bias_cache(
+            self.gate["bias"],
+            "gate_bias_fp32_cache",
+            "_gate_bias_fp32_version",
+        )
+
+    def _get_mlp1_bias_fp32(self) -> torch.Tensor:
+        return self._get_fp32_bias_cache(
+            self.mlp1_bias,
+            "mlp1_bias_fp32_cache",
+            "_mlp1_bias_fp32_version",
+        )
+
+    def _get_mlp2_bias_fp32(self) -> torch.Tensor:
+        return self._get_fp32_bias_cache(
+            self.mlp2_bias,
+            "mlp2_bias_fp32_cache",
+            "_mlp2_bias_fp32_version",
+        )
 
     @record_function("mlp")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, n_ctx, dim = x.shape
         t = self.norm(x)
+        gate_bias = self._get_gate_bias_fp32()
+        mlp1_bias = self._get_mlp1_bias_fp32()
+        mlp2_bias = self._get_mlp2_bias_fp32()
 
         t = t.view(batch_size * n_ctx, dim)
         if (
@@ -511,9 +571,9 @@ class MLPBlock(torch.nn.Module):
                 self.gate["weight"],
                 self.mlp1_weight_tensor, self.mlp1_weight_mx,
                 self.mlp2_weight_tensor, self.mlp2_weight_mx,
-                self.gate["bias"].float(),
-                self.mlp1_bias.float(),
-                self.mlp2_bias.float(),
+                gate_bias,
+                mlp1_bias,
+                mlp2_bias,
                 experts_per_token=self.experts_per_token,
                 num_experts=self.num_experts,
                 swiglu_limit=self.swiglu_limit,
@@ -524,9 +584,9 @@ class MLPBlock(torch.nn.Module):
                 self.gate["weight"],
                 self.mlp1_weight_tensor, self.mlp1_weight_mx,
                 self.mlp2_weight_tensor, self.mlp2_weight_mx,
-                self.gate["bias"].float(),
-                self.mlp1_bias.float(),
-                self.mlp2_bias.float(),
+                gate_bias,
+                mlp1_bias,
+                mlp2_bias,
                 experts_per_token=self.experts_per_token,
                 num_experts=self.num_experts,
                 swiglu_limit=self.swiglu_limit,
@@ -614,22 +674,27 @@ class Transformer(torch.nn.Module):
                     loaded_tensor, scales = quantize_mx4(loaded_tensor.mT.contiguous())
                     _, block_index, _, _ = name.split(".")
                     model.block[int(block_index)].mlp.mlp1_weight_mx = scales
-                    param.data.copy_(loaded_tensor.storage.data)
+                    with torch.no_grad():
+                        param.copy_(loaded_tensor.storage.data)
                 else:
-                    param.data.copy_(loaded_tensor)
+                    with torch.no_grad():
+                        param.copy_(loaded_tensor)
 
             elif "mlp2_weight" in name:
                 loaded_tensor, scales = quantize_mx4(loaded_tensor.mT.contiguous())
                 _, block_index, _, _ = name.split(".")
                 model.block[int(block_index)].mlp.mlp2_weight_mx = scales
-                param.data.copy_(loaded_tensor.storage.data)
+                with torch.no_grad():
+                    param.copy_(loaded_tensor.storage.data)
 
             elif "gate" in name and loaded_tensor.ndim == 2:
                 loaded_tensor = loaded_tensor.mT.contiguous()
-                param.data.copy_(loaded_tensor)
+                with torch.no_grad():
+                    param.copy_(loaded_tensor)
 
             else:
-                param.data.copy_(loaded_tensor)
+                with torch.no_grad():
+                    param.copy_(loaded_tensor)
 
         # NOTE: Required to avoid OOM errors
         torch.cuda.empty_cache()
