@@ -310,6 +310,7 @@ class AttentionBlock(torch.nn.Module):
     @record_function("attn")
     def forward(self, x: torch.Tensor, cache: Cache | None = None) -> torch.Tensor:
         batch_size, n_ctx, dim = x.shape
+        fused_decode = False
 
         t = self.norm(x)
         with record_function("qkv"):
@@ -321,6 +322,7 @@ class AttentionBlock(torch.nn.Module):
                 and t.is_cuda
                 and t.dtype == torch.bfloat16
             ):
+                fused_decode = True
                 offset = cache.offset.clone()
                 q = qkv_rope_cache_decode_forward(
                     t,
@@ -337,17 +339,20 @@ class AttentionBlock(torch.nn.Module):
                     self.head_dim,
                 )
                 cache.offset.add_(1)
-                k, v = cache.k, cache.v
             else:
                 qkv = self.qkv(t)
                 q, k, v = torch.split(qkv, (q_dim, kv_dim, kv_dim), dim=-1)
                 q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
         q = q.view(batch_size, n_ctx, self.num_attention_heads, self.head_dim)
-        k = k.view(batch_size, n_ctx, self.num_key_value_heads, self.head_dim)
-        v = v.view(batch_size, n_ctx, self.num_key_value_heads, self.head_dim)
+        if fused_decode:
+            k = cache.k
+            v = cache.v
+        else:
+            k = k.view(batch_size, n_ctx, self.num_key_value_heads, self.head_dim)
+            v = v.view(batch_size, n_ctx, self.num_key_value_heads, self.head_dim)
 
-        if cache is not None and n_ctx == 1 and t.is_cuda and t.dtype == torch.bfloat16:
+        if fused_decode:
             pass
         elif cache is not None:
             offset = cache.offset.clone()
@@ -360,8 +365,8 @@ class AttentionBlock(torch.nn.Module):
         q = q.view(
             batch_size,
             n_ctx,
-            self.num_attention_heads // self.num_key_value_heads,
             self.num_key_value_heads,
+            self.num_attention_heads // self.num_key_value_heads,
             self.head_dim,
         )
         with record_function("attn_kernel"):
