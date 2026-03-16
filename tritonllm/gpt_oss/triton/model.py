@@ -17,7 +17,7 @@ if not cuda_capability_geq(9):
 else:
     from gpt_oss.triton.attention_tt_tma import attention
 
-from gpt_oss.triton.moe import quantize_mx4, moe
+from gpt_oss.triton.moe import quantize_mx4, moe, moe_decode
 from gpt_oss.triton.triton_kernels import (
     out_residual_decode_forward,
     qkv_rope_cache_decode_forward,
@@ -500,18 +500,37 @@ class MLPBlock(torch.nn.Module):
         t = self.norm(x)
 
         t = t.view(batch_size * n_ctx, dim)
-        t = moe(
-            t,
-            self.gate["weight"],
-            self.mlp1_weight_tensor, self.mlp1_weight_mx,
-            self.mlp2_weight_tensor, self.mlp2_weight_mx,
-            self.gate["bias"].float(),
-            self.mlp1_bias.float(),
-            self.mlp2_bias.float(),
-            experts_per_token=self.experts_per_token,
-            num_experts=self.num_experts,
-            swiglu_limit=self.swiglu_limit,
-        )
+        if (
+            x.is_cuda
+            and n_ctx == 1
+            and x.dtype == torch.bfloat16
+            and self.gate["weight"].dtype == torch.bfloat16
+        ):
+            t = moe_decode(
+                t,
+                self.gate["weight"],
+                self.mlp1_weight_tensor, self.mlp1_weight_mx,
+                self.mlp2_weight_tensor, self.mlp2_weight_mx,
+                self.gate["bias"].float(),
+                self.mlp1_bias.float(),
+                self.mlp2_bias.float(),
+                experts_per_token=self.experts_per_token,
+                num_experts=self.num_experts,
+                swiglu_limit=self.swiglu_limit,
+            )
+        else:
+            t = moe(
+                t,
+                self.gate["weight"],
+                self.mlp1_weight_tensor, self.mlp1_weight_mx,
+                self.mlp2_weight_tensor, self.mlp2_weight_mx,
+                self.gate["bias"].float(),
+                self.mlp1_bias.float(),
+                self.mlp2_bias.float(),
+                experts_per_token=self.experts_per_token,
+                num_experts=self.num_experts,
+                swiglu_limit=self.swiglu_limit,
+            )
         t = t.view(batch_size, n_ctx, dim)
 
         return x + t
