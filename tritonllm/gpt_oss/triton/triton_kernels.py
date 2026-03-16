@@ -417,6 +417,8 @@ def qkv_rope_cache_decode_kernel(
             q_dim + kv_dim + v_head * HEAD_DIM,
         ),
     )
+    out_offsets = out_base + offs_d
+    out_mask = out_offsets < total_heads * HEAD_DIM
 
     hidden_ptr = hidden_ptr + pid_batch.to(tl.int64) * stride_hidden_batch
     acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
@@ -430,15 +432,16 @@ def qkv_rope_cache_decode_kernel(
         )
         weight = tl.load(
             weight_ptr
-            + (out_base + offs_d)[:, None].to(tl.int64) * stride_weight_out
+            + out_offsets[:, None].to(tl.int64) * stride_weight_out
             + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
-            mask=k_offsets[None, :] < hidden_size,
+            mask=out_mask[:, None] & (k_offsets[None, :] < hidden_size),
             other=0,
         )
         acc += tl.sum(weight * hidden[None, :], axis=1)
 
     bias = tl.load(
-        bias_ptr + (out_base + offs_d).to(tl.int64) * stride_bias_out,
+        bias_ptr + out_offsets.to(tl.int64) * stride_bias_out,
+        mask=out_mask,
         other=0,
     )
     acc += bias.to(tl.float32)
