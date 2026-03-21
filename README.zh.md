@@ -40,6 +40,12 @@ LLM Inference via Triton 🚀
 pip install tritonllm
 ```
 
+如果要启用可选的 `triton_runner` JIT 后端，可以安装：
+
+```shell
+pip install "tritonllm[runner]"
+```
+
 ## 命令行界面 (CLI)
 
 快速启动 gpt-oss-20b 模型的对话，将自动从 ModelScope 魔搭下载。
@@ -91,6 +97,22 @@ cd tritonllm
 
 pip install -e .
 ```
+
+如果要同时安装可选 runner 后端：
+
+```shell
+pip install -e ".[runner]"
+```
+
+## JIT 后端切换
+
+项目默认仍然使用 `@triton.jit`。如果想让仓库内部管理的 kernel 在导入时切换到 `@triton_runner.jit`，设置：
+
+```shell
+export TRITONLLM_JIT_BACKEND=triton_runner
+```
+
+支持的取值为 `triton` 和 `triton_runner`。如果选择了 `triton_runner` 但没有安装可选依赖，导入时会直接报错，不会静默回退。
 
 ## 样例
 

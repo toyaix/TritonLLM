@@ -4,6 +4,8 @@ import textwrap
 import types
 import triton
 
+from tritonllm.jit_backend import create_jit_function
+
 
 def cacheable(f):
     """
@@ -54,7 +56,7 @@ def define_kernel(src, module, attrs=None, **extra_globals):
 
     if attrs is None:
         attrs = dict()
-    f = triton.JITFunction(f, **attrs)
+    f = create_jit_function(f, **attrs)
     f._unsafe_update_src(src)
     return f
 

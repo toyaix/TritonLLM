@@ -17,8 +17,15 @@ if not cuda_capability_geq(9):
 else:
     from gpt_oss.triton.attention_tt_tma import attention
 
-from gpt_oss.triton.moe import quantize_mx4, moe
-from gpt_oss.triton.triton_kernels import rmsnorm_forward, rope_forward, unembedding_forward
+from gpt_oss.triton.moe import quantize_mx4, moe, moe_decode
+from gpt_oss.triton.triton_kernels import (
+    out_residual_decode_forward,
+    qkv_rope_cache_decode_forward,
+    qkv_decode_forward,
+    rmsnorm_forward,
+    rope_forward,
+    unembedding_decode_forward,
+)
 
 @dataclass
 class ModelConfig:
@@ -66,6 +73,14 @@ class UnEmbedding(torch.nn.Module):
 
     @record_function("unembedding_linear")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            x.is_cuda
+            and x.ndim == 3
+            and x.shape[1] == 1
+            and x.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+        ):
+            return unembedding_decode_forward(x, self.weight)
         return torch.nn.functional.linear(x, self.weight, bias=None)
 
 
@@ -85,6 +100,27 @@ class QKV(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.linear(x, self.weight, self.bias)
 
+    @record_function("qkv_linear_decode")
+    def decode(
+        self,
+        x: torch.Tensor,
+        q_dim: int,
+        kv_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if (
+            x.is_cuda
+            and x.ndim == 3
+            and x.shape[1] == 1
+            and x.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+            and self.bias.dtype == torch.bfloat16
+        ):
+            return qkv_decode_forward(x, self.weight, self.bias, q_dim, kv_dim)
+
+        qkv = self.forward(x)
+        q, k, v = torch.split(qkv, (q_dim, kv_dim, kv_dim), dim=-1)
+        return q.contiguous(), k.contiguous(), v.contiguous()
+
 
 class OUT(torch.nn.Module):
     def __init__(
@@ -101,6 +137,21 @@ class OUT(torch.nn.Module):
     @record_function("out_linear")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.linear(x, self.weight, self.bias)
+
+    @record_function("out_linear_decode")
+    def decode_residual(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        if (
+            x.is_cuda
+            and x.ndim == 3
+            and x.shape[1] == 1
+            and x.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+            and self.bias.dtype == torch.bfloat16
+            and residual.shape == (x.shape[0], 1, self.weight.shape[0])
+            and residual.dtype == torch.bfloat16
+        ):
+            return out_residual_decode_forward(x, self.weight, self.bias, residual)
+        return self.forward(x) + residual
 
 
 class RotaryEmbedding(torch.nn.Module):
@@ -275,23 +326,51 @@ class AttentionBlock(torch.nn.Module):
     @record_function("attn")
     def forward(self, x: torch.Tensor, cache: Cache | None = None) -> torch.Tensor:
         batch_size, n_ctx, dim = x.shape
+        fused_decode = False
 
         t = self.norm(x)
         with record_function("qkv"):
-            qkv = self.qkv(t)
-            qkv_parts = (
-                self.num_attention_heads * self.head_dim,
-                self.num_key_value_heads * self.head_dim,
-                self.num_key_value_heads * self.head_dim
-            )
-            q, k, v = torch.split(qkv, qkv_parts, dim=-1)
-            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+            q_dim = self.num_attention_heads * self.head_dim
+            kv_dim = self.num_key_value_heads * self.head_dim
+            if (
+                cache is not None
+                and n_ctx == 1
+                and t.is_cuda
+                and t.dtype == torch.bfloat16
+            ):
+                fused_decode = True
+                offset = cache.offset.clone()
+                q = qkv_rope_cache_decode_forward(
+                    t,
+                    self.qkv.weight,
+                    self.qkv.bias,
+                    self.rope.sin,
+                    self.rope.cos,
+                    self.rope.max_context_length,
+                    cache.k,
+                    cache.v,
+                    offset,
+                    self.num_attention_heads,
+                    self.num_key_value_heads,
+                    self.head_dim,
+                )
+                cache.offset.add_(1)
+            else:
+                qkv = self.qkv(t)
+                q, k, v = torch.split(qkv, (q_dim, kv_dim, kv_dim), dim=-1)
+                q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
         q = q.view(batch_size, n_ctx, self.num_attention_heads, self.head_dim)
-        k = k.view(batch_size, n_ctx, self.num_key_value_heads, self.head_dim)
-        v = v.view(batch_size, n_ctx, self.num_key_value_heads, self.head_dim)
+        if fused_decode:
+            k = cache.k
+            v = cache.v
+        else:
+            k = k.view(batch_size, n_ctx, self.num_key_value_heads, self.head_dim)
+            v = v.view(batch_size, n_ctx, self.num_key_value_heads, self.head_dim)
 
-        if cache is not None:
+        if fused_decode:
+            pass
+        elif cache is not None:
             offset = cache.offset.clone()
             q, k = self.rope(q, k, offset=offset)
             k, v = cache.extend(k, v)
@@ -302,8 +381,8 @@ class AttentionBlock(torch.nn.Module):
         q = q.view(
             batch_size,
             n_ctx,
-            self.num_attention_heads // self.num_key_value_heads,
             self.num_key_value_heads,
+            self.num_attention_heads // self.num_key_value_heads,
             self.head_dim,
         )
         with record_function("attn_kernel"):
@@ -339,8 +418,11 @@ class AttentionBlock(torch.nn.Module):
                 )
 
         with record_function("c_proj"):
-            t = self.out(t)
-        t = x + t
+            if fused_decode:
+                t = self.out.decode_residual(t, x)
+            else:
+                t = self.out(t)
+                t = x + t
         return t
 
 
@@ -373,6 +455,12 @@ class MLPBlock(torch.nn.Module):
                 )
             ),
         })
+        self.register_buffer(
+            "gate_bias_fp32_cache",
+            self.gate["bias"].detach().float().clone(),
+            persistent=False,
+        )
+        self._gate_bias_fp32_version = self._maybe_tensor_version(self.gate["bias"])
         self.mlp1_weight_tensor, self.mlp1_weight_mx = quantize_mx4(
             torch.empty(
                 (
@@ -392,6 +480,12 @@ class MLPBlock(torch.nn.Module):
                 dtype=torch.bfloat16,
             )
         )
+        self.register_buffer(
+            "mlp1_bias_fp32_cache",
+            self.mlp1_bias.detach().float().clone(),
+            persistent=False,
+        )
+        self._mlp1_bias_fp32_version = self._maybe_tensor_version(self.mlp1_bias)
         self.mlp2_weight_tensor, self.mlp2_weight_mx = quantize_mx4(
             torch.empty(
                 (
@@ -411,25 +505,129 @@ class MLPBlock(torch.nn.Module):
                 dtype=torch.bfloat16,
             )
         )
+        self.register_buffer(
+            "mlp2_bias_fp32_cache",
+            self.mlp2_bias.detach().float().clone(),
+            persistent=False,
+        )
+        self._mlp2_bias_fp32_version = self._maybe_tensor_version(self.mlp2_bias)
+
+    @staticmethod
+    def _maybe_tensor_version(param: torch.Tensor) -> int | None:
+        try:
+            return param._version
+        except RuntimeError:
+            return None
+
+    def _refresh_fp32_bias_cache(
+        self,
+        param: torch.Tensor,
+        cache_name: str,
+        version_name: str,
+    ) -> torch.Tensor:
+        cache = getattr(self, cache_name)
+        if cache.device != param.device or cache.shape != param.shape:
+            cache = torch.empty_like(param, dtype=torch.float32, device=param.device)
+            setattr(self, cache_name, cache)
+        cache.copy_(param.detach())
+        setattr(self, version_name, self._maybe_tensor_version(param))
+        return cache
+
+    def refresh_fp32_bias_caches(self) -> None:
+        self._refresh_fp32_bias_cache(
+            self.gate["bias"],
+            "gate_bias_fp32_cache",
+            "_gate_bias_fp32_version",
+        )
+        self._refresh_fp32_bias_cache(
+            self.mlp1_bias,
+            "mlp1_bias_fp32_cache",
+            "_mlp1_bias_fp32_version",
+        )
+        self._refresh_fp32_bias_cache(
+            self.mlp2_bias,
+            "mlp2_bias_fp32_cache",
+            "_mlp2_bias_fp32_version",
+        )
+
+    def _get_fp32_bias_cache(
+        self,
+        param: torch.Tensor,
+        cache_name: str,
+        version_name: str,
+    ) -> torch.Tensor:
+        cache = getattr(self, cache_name)
+        if cache.device != param.device or cache.shape != param.shape:
+            return self._refresh_fp32_bias_cache(param, cache_name, version_name)
+
+        version = self._maybe_tensor_version(param)
+        if version is None:
+            return cache
+        if getattr(self, version_name) != version:
+            return self._refresh_fp32_bias_cache(param, cache_name, version_name)
+        return cache
+
+    def _get_gate_bias_fp32(self) -> torch.Tensor:
+        return self._get_fp32_bias_cache(
+            self.gate["bias"],
+            "gate_bias_fp32_cache",
+            "_gate_bias_fp32_version",
+        )
+
+    def _get_mlp1_bias_fp32(self) -> torch.Tensor:
+        return self._get_fp32_bias_cache(
+            self.mlp1_bias,
+            "mlp1_bias_fp32_cache",
+            "_mlp1_bias_fp32_version",
+        )
+
+    def _get_mlp2_bias_fp32(self) -> torch.Tensor:
+        return self._get_fp32_bias_cache(
+            self.mlp2_bias,
+            "mlp2_bias_fp32_cache",
+            "_mlp2_bias_fp32_version",
+        )
 
     @record_function("mlp")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, n_ctx, dim = x.shape
         t = self.norm(x)
+        gate_bias = self._get_gate_bias_fp32()
+        mlp1_bias = self._get_mlp1_bias_fp32()
+        mlp2_bias = self._get_mlp2_bias_fp32()
 
         t = t.view(batch_size * n_ctx, dim)
-        t = moe(
-            t,
-            self.gate["weight"],
-            self.mlp1_weight_tensor, self.mlp1_weight_mx,
-            self.mlp2_weight_tensor, self.mlp2_weight_mx,
-            self.gate["bias"].float(),
-            self.mlp1_bias.float(),
-            self.mlp2_bias.float(),
-            experts_per_token=self.experts_per_token,
-            num_experts=self.num_experts,
-            swiglu_limit=self.swiglu_limit,
-        )
+        if (
+            x.is_cuda
+            and n_ctx == 1
+            and x.dtype == torch.bfloat16
+            and self.gate["weight"].dtype == torch.bfloat16
+        ):
+            t = moe_decode(
+                t,
+                self.gate["weight"],
+                self.mlp1_weight_tensor, self.mlp1_weight_mx,
+                self.mlp2_weight_tensor, self.mlp2_weight_mx,
+                gate_bias,
+                mlp1_bias,
+                mlp2_bias,
+                experts_per_token=self.experts_per_token,
+                num_experts=self.num_experts,
+                swiglu_limit=self.swiglu_limit,
+            )
+        else:
+            t = moe(
+                t,
+                self.gate["weight"],
+                self.mlp1_weight_tensor, self.mlp1_weight_mx,
+                self.mlp2_weight_tensor, self.mlp2_weight_mx,
+                gate_bias,
+                mlp1_bias,
+                mlp2_bias,
+                experts_per_token=self.experts_per_token,
+                num_experts=self.num_experts,
+                swiglu_limit=self.swiglu_limit,
+            )
         t = t.view(batch_size, n_ctx, dim)
 
         return x + t
@@ -513,22 +711,30 @@ class Transformer(torch.nn.Module):
                     loaded_tensor, scales = quantize_mx4(loaded_tensor.mT.contiguous())
                     _, block_index, _, _ = name.split(".")
                     model.block[int(block_index)].mlp.mlp1_weight_mx = scales
-                    param.data.copy_(loaded_tensor.storage.data)
+                    with torch.no_grad():
+                        param.copy_(loaded_tensor.storage.data)
                 else:
-                    param.data.copy_(loaded_tensor)
+                    with torch.no_grad():
+                        param.copy_(loaded_tensor)
 
             elif "mlp2_weight" in name:
                 loaded_tensor, scales = quantize_mx4(loaded_tensor.mT.contiguous())
                 _, block_index, _, _ = name.split(".")
                 model.block[int(block_index)].mlp.mlp2_weight_mx = scales
-                param.data.copy_(loaded_tensor.storage.data)
+                with torch.no_grad():
+                    param.copy_(loaded_tensor.storage.data)
 
             elif "gate" in name and loaded_tensor.ndim == 2:
                 loaded_tensor = loaded_tensor.mT.contiguous()
-                param.data.copy_(loaded_tensor)
+                with torch.no_grad():
+                    param.copy_(loaded_tensor)
 
             else:
-                param.data.copy_(loaded_tensor)
+                with torch.no_grad():
+                    param.copy_(loaded_tensor)
+
+        for block in model.block:
+            block.mlp.refresh_fp32_bias_caches()
 
         # NOTE: Required to avoid OOM errors
         torch.cuda.empty_cache()

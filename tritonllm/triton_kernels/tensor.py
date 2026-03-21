@@ -23,6 +23,12 @@ class Storage:
     def device(self):
         return self.data.device
 
+    def __dlpack__(self, *args, **kwargs):
+        return self.data.__dlpack__(*args, **kwargs)
+
+    def __dlpack_device__(self):
+        return self.data.__dlpack_device__()
+
     def is_tma_compliant(self):
         # TMAs didn't exist until Hopper
         if not cuda_capability_geq(9, 0):
@@ -148,6 +154,12 @@ class Tensor:
     def data(self):
         t = self.storage
         return t.data if isinstance(t, Storage) else t
+
+    def __dlpack__(self, *args, **kwargs):
+        return self.data.__dlpack__(*args, **kwargs)
+
+    def __dlpack_device__(self):
+        return self.data.__dlpack_device__()
 
     def dim(self):
         return self.ndim
