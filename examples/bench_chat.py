@@ -14,4 +14,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     checkpoint = get_model_with_checkpoint(args.checkpoint)
     tool = HarmonyChatTool(checkpoint, reasoning_effort="high")
-    result = tool.benchmark_mode()
+    result = tool.benchmark_mode(warmup_prompts_per_file=1, warmup_max_tokens=16)

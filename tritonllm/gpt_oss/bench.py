@@ -307,7 +307,7 @@ class HarmonyChatTool:
 
         return current_output_text
 
-    def _benchmark_inference(self, user_message: str, messages: List[Message]) -> int:
+    def _benchmark_inference(self, user_message: str, messages: List[Message], max_tokens: int = 0) -> int:
         """Perform benchmark inference returning token count"""
         user_msg = Message.from_role_and_content(Role.USER, user_message)
         messages.append(user_msg)
@@ -316,7 +316,7 @@ class HarmonyChatTool:
 
         token_num = 0
         for predicted_token in self.generator.generate(
-            tokens, self.encoding.stop_tokens_for_assistant_actions()
+            tokens, self.encoding.stop_tokens_for_assistant_actions(), max_tokens=max_tokens
         ):
             token_num += 1
 
@@ -589,7 +589,12 @@ class HarmonyChatTool:
             for line in self.get_file_lines(file_name):
                 self.single_inference(line, interactive=True)
 
-    def benchmark_mode(self, prompt_files: List[str] = None):
+    def benchmark_mode(
+        self,
+        prompt_files: List[str] = None,
+        warmup_prompts_per_file: int = 1,
+        warmup_max_tokens: int = 16,
+    ):
         """Run benchmark mode"""
         if prompt_files is None:
             prompt_files = ["prompt_zh.txt", "prompt.txt"]
@@ -602,10 +607,11 @@ class HarmonyChatTool:
         print(termcolor.colored("Warming up...", "yellow"))
         for file_name in prompt_files:
             lines = self.get_file_lines(file_name, shuffle=False)
-            messages = self.base_messages.copy()
-            self._benchmark_inference(lines[0], messages)
-            messages = self.base_messages.copy()
-            self._benchmark_inference(lines[3], messages)
+            if not lines:
+                continue
+            for user_message in lines[:warmup_prompts_per_file]:
+                messages = self.base_messages.copy()
+                self._benchmark_inference(user_message, messages, max_tokens=warmup_max_tokens)
 
         # Run benchmarks
         overall_stats = {"total_time": 0, "total_tokens": 0}
