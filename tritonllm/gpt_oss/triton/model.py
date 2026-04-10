@@ -471,6 +471,7 @@ class PagedCache:
         self._k_flat = self.k.view(1, num_blocks * block_size, n_kv_heads, d_head)
         self._v_flat = self.v.view(1, num_blocks * block_size, n_kv_heads, d_head)
         self.block_table: list[int] = []
+        self.window_start = 0
         self.offset = torch.zeros((1,), dtype=torch.long, device=device)
         # Pre-allocated slot tensor for decode steps (nano-vllm graph_vars pattern).
         # Updated by prepare_decode_slot() *before* each graph.replay() so that
@@ -494,18 +495,54 @@ class PagedCache:
         if self.block_table:
             self.block_manager.deallocate(self.block_table)
             # deallocate() clears block_table in place
+        self.window_start = 0
         self.offset.zero_()
 
     def _slot(self, pos: int) -> int:
         bs = self.block_size
-        return self.block_table[pos // bs] * bs + pos % bs
+        local_pos = pos - self.window_start
+        if local_pos < 0:
+            raise ValueError(f"position {pos} is older than the retained window starting at {self.window_start}")
+        return self.block_table[local_pos // bs] * bs + local_pos % bs
+
+    def _visible_tokens(self, length: int | None = None) -> int:
+        if length is None:
+            length = int(self.offset.item())
+        return max(0, length - self.window_start)
+
+    def _logical_kv_view(self, length: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        visible_tokens = self._visible_tokens(length)
+        if not self.block_table or visible_tokens == 0:
+            empty_shape = (1, 0, self.n_kv_heads, self.d_head)
+            return self.k.new_empty(empty_shape), self.v.new_empty(empty_shape)
+
+        block_order = torch.tensor(self.block_table, dtype=torch.long, device=self.k.device)
+        k_view = self.k.index_select(0, block_order).view(1, -1, self.n_kv_heads, self.d_head)
+        v_view = self.v.index_select(0, block_order).view(1, -1, self.n_kv_heads, self.d_head)
+        return k_view[:, :visible_tokens], v_view[:, :visible_tokens]
+
+    def _evict_oldest_block(self) -> None:
+        if not self.block_table:
+            raise RuntimeError("Cannot evict from an empty KV cache")
+        oldest_bid = self.block_table.pop(0)
+        block = self.block_manager.blocks[oldest_bid]
+        block.ref_count -= 1
+        if block.ref_count == 0:
+            self.block_manager._deallocate_block(oldest_bid)
+        self.window_start += self.block_size
 
     def _ensure_blocks(self, length: int) -> None:
-        needed = math.ceil(length / self.block_size) if length > 0 else 0
+        capacity = self.block_manager.capacity
+        min_window_start = max(0, length - capacity)
+        while self.window_start < min_window_start:
+            self._evict_oldest_block()
+        needed = math.ceil(max(0, length - self.window_start) / self.block_size) if length > 0 else 0
         while len(self.block_table) < needed:
-            self.block_manager.append_block(self.block_table)
+            self.append_block()
 
     def append_block(self) -> None:
+        if not self.block_manager.free_block_ids:
+            self._evict_oldest_block()
         self.block_manager.append_block(self.block_table)
 
     def set_decode_slot(self, offset: int) -> None:
@@ -552,7 +589,7 @@ class PagedCache:
                 self.k, self.v, self._decode_slot,
             )
             self.offset.add_(1)
-            return self.k_flat, self.v_flat
+            return self._logical_kv_view()
         else:
             # Prefill: compute slot_mapping entirely on GPU (no Python loop)
             offset = int(self.offset.item())
@@ -561,7 +598,8 @@ class PagedCache:
             # block_table is small (num_blocks entries); copy to GPU once
             bt = torch.tensor(self.block_table, dtype=torch.int32, device=k.device)
             positions = torch.arange(offset, offset + n_ctx, dtype=torch.int32, device=k.device)
-            slot_mapping = bt[positions // bs] * bs + positions % bs
+            local_positions = positions - self.window_start
+            slot_mapping = bt[local_positions // bs] * bs + local_positions % bs
             store_kvcache(
                 k.view(n_ctx, self.n_kv_heads, self.d_head),
                 v.view(n_ctx, self.n_kv_heads, self.d_head),
@@ -569,7 +607,7 @@ class PagedCache:
             )
             self.offset.add_(n_ctx)
             new_len = offset + n_ctx
-            return self.k_flat[:, :new_len], self.v_flat[:, :new_len]
+            return self._logical_kv_view(new_len)
 
     def truncate(self, n_ctx: int):
         """Truncate cache to n_ctx tokens, freeing excess blocks."""
@@ -582,8 +620,9 @@ class PagedCache:
             if bm.blocks[bid].ref_count == 0:
                 bm.used_block_ids.remove(bid)
                 bm.free_block_ids.append(bid)
+        self.window_start = min(self.window_start, n_ctx)
         self.offset.fill_(n_ctx)
-        return self.k_flat, self.v_flat
+        return self._logical_kv_view(n_ctx)
 
     def repeat_interleave(self, n: int) -> None:
         raise NotImplementedError("repeat_interleave is not supported with PagedCache")
@@ -1070,7 +1109,6 @@ class TokenGenerator:
         with torch.cuda.graph(self.graph):
             self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
         self._sampling_probs = torch.empty_like(self.logits[0])
-        self._sampling_noise = torch.empty_like(self.logits[0])
 
     @property
     def max_model_len(self) -> int:
@@ -1140,25 +1178,14 @@ class TokenGenerator:
 
     @torch.inference_mode()
     def sample_next_token(self, logits: torch.Tensor, temperature: float) -> int:
-        """Executed only on rank 0.
-
-        Uses the Gumbel-max trick instead of torch.multinomial:
-            argmax(probs / Exponential(1))  ~  Categorical(probs)
-
-        exponential_() + argmax() are pure GPU ops that compile/fuse cleanly,
-        whereas torch.multinomial requires a parallel prefix scan and is slower.
-        """
+        """Executed only on rank 0."""
         logits = logits[-1]
         if temperature == 0.0:
             return logits.argmax().item()
-        # Gumbel-max trick: argmax(exp(logits/T) / Exp(1)) ~ Categorical(softmax(logits/T))
-        # Normalization (÷ Z) cancels in argmax — skip softmax, just exp for unnormalized weights.
-        # Subtract max first for numerical stability.
         self._sampling_probs.copy_(logits)
-        self._sampling_probs.div_(temperature).sub_(self._sampling_probs.max())
-        self._sampling_probs.exp_()
-        self._sampling_noise.exponential_().clamp_min_(1e-10)
-        return self._sampling_probs.div_(self._sampling_noise).argmax().item()
+        self._sampling_probs.div_(temperature)
+        torch.softmax(self._sampling_probs, dim=-1, out=self._sampling_probs)
+        return torch.multinomial(self._sampling_probs, num_samples=1).item()
 
     def _prepare_decode_slots(self, decode_offset: int) -> None:
         if decode_offset % self.block_size == 0:
@@ -1305,6 +1332,15 @@ class TokenGenerator:
                 torch.cuda.synchronize(self.device)
             decode_start = time.perf_counter()
             while num_generated_tokens < profile_steps:
+                if decode_offset >= self.max_model_len:
+                    print(
+                        termcolor.colored(
+                            f"Decode profiling stopped at max_model_len={self.max_model_len}",
+                            "yellow",
+                        ),
+                        flush=True,
+                    )
+                    break
                 with record_function("decode_step"):
                     self.input_token[0] = predicted_token
                     with record_function("prepare_decode_slots"):
@@ -1373,6 +1409,15 @@ class TokenGenerator:
         num_generated_tokens = 0
 
         while max_tokens == 0 or num_generated_tokens < max_tokens:
+            if decode_offset >= self.max_model_len:
+                print(
+                    termcolor.colored(
+                        f"Decode stopped at max_model_len={self.max_model_len}",
+                        "yellow",
+                    ),
+                    flush=True,
+                )
+                break
             self.input_token[0] = predicted_token
             self._prepare_decode_slots(decode_offset)
             self.graph.replay()
