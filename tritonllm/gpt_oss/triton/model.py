@@ -1,12 +1,11 @@
+import hashlib
 import json
 import math
 import os
+import struct
 import termcolor
 from collections import deque
 from dataclasses import dataclass
-
-import numpy as np
-import xxhash as _xxhash
 
 import torch
 import triton
@@ -366,7 +365,7 @@ class BlockManager:
     A block_table maps logical block indices → physical block ids.
     slot = block_table[pos // block_size] * block_size + pos % block_size
 
-    Supports hash-based prefix caching (requires xxhash) and ref-counted
+    Supports hash-based prefix caching and ref-counted
     block ownership for shared blocks between sequences.
     """
 
@@ -380,12 +379,13 @@ class BlockManager:
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1) -> int:
-        """Compute xxhash over token_ids chained with prefix hash."""
-        h = _xxhash.xxh64()
+        """Compute a deterministic 64-bit SHA-256 hash over block tokens."""
+        h = hashlib.sha256()
         if prefix != -1:
-            h.update(prefix.to_bytes(8, "little"))
-        h.update(np.array(token_ids, dtype=np.int64).tobytes())
-        return h.intdigest()
+            h.update(prefix.to_bytes(8, "little", signed=False))
+        if token_ids:
+            h.update(struct.pack(f"<{len(token_ids)}q", *token_ids))
+        return int.from_bytes(h.digest()[:8], "little", signed=False)
 
     @property
     def num_free_blocks(self) -> int:
