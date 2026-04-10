@@ -578,6 +578,8 @@ class PagedCache:
             (num_blocks, block_size, n_kv_heads, d_head),
             dtype=torch.bfloat16, device=device,
         )
+        self._k_flat = self.k.view(1, num_blocks * block_size, n_kv_heads, d_head)
+        self._v_flat = self.v.view(1, num_blocks * block_size, n_kv_heads, d_head)
         self.block_table: list[int] = []
         self.offset = torch.zeros((1,), dtype=torch.long, device=device)
         # Pre-allocated slot tensor for decode steps (nano-vllm graph_vars pattern).
@@ -592,13 +594,11 @@ class PagedCache:
     @property
     def k_flat(self) -> torch.Tensor:
         """[1, total_slots, n_kv_heads, d_head] — zero-copy view."""
-        nb, bs = self.block_manager.num_blocks, self.block_manager.block_size
-        return self.k.view(1, nb * bs, self.n_kv_heads, self.d_head)
+        return self._k_flat
 
     @property
     def v_flat(self) -> torch.Tensor:
-        nb, bs = self.block_manager.num_blocks, self.block_manager.block_size
-        return self.v.view(1, nb * bs, self.n_kv_heads, self.d_head)
+        return self._v_flat
 
     def reset(self) -> None:
         if self.block_table:
@@ -615,6 +615,12 @@ class PagedCache:
         while len(self.block_table) < needed:
             self.block_manager.append_block(self.block_table)
 
+    def append_block(self) -> None:
+        self.block_manager.append_block(self.block_table)
+
+    def set_decode_slot(self, offset: int) -> None:
+        self._decode_slot[0] = self._slot(offset)
+
     def prepare_decode_slot(self, offset: int | None = None) -> None:
         """Compute and cache the slot for the next decode step.
 
@@ -630,7 +636,7 @@ class PagedCache:
         if offset is None:
             offset = int(self.offset.item())   # D2H sync — only OK outside the graph
         self._ensure_blocks(offset + 1)
-        self._decode_slot[0] = self._slot(offset)
+        self.set_decode_slot(offset)
 
     def extend(self, k: torch.Tensor, v: torch.Tensor):
         """Scatter k, v [1, n_ctx, n_kv_heads, d_head] into the paged cache.
@@ -1144,12 +1150,23 @@ class Transformer(torch.nn.Module):
 
 class TokenGenerator:
     @torch.inference_mode()
-    def __init__(self, checkpoint: str, context: int, device: torch.device):
+    def __init__(
+        self,
+        checkpoint: str,
+        context: int,
+        device: torch.device,
+        gpu_memory_utilization: float | None = None,
+    ):
         self.device = device
         print(termcolor.colored("Loading model checkpoint...", "yellow"), flush=True)
         self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
-        # context hint is used as a minimum; actual allocation is GPU-memory driven
-        self.caches = self._allocate_kv_cache(min_context=context)
+        # By default allocate exactly enough KV cache for the requested context.
+        # Passing gpu_memory_utilization opts into the more aggressive auto-sizing mode.
+        self.caches = self._allocate_kv_cache(
+            min_context=context,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
+        self.block_size = self.caches[0].block_size
         self.input_token = torch.zeros(1, dtype=torch.int32, device=self.device)
         # warmup — prepare_decode_slot() fills _decode_slot before the forward pass
         for cache in self.caches:
@@ -1182,46 +1199,44 @@ class TokenGenerator:
         self,
         min_context: int = 8192,
         block_size: int = 256,
-        gpu_memory_utilization: float = 0.85,
+        gpu_memory_utilization: float | None = None,
     ) -> list[PagedCache]:
-        """Allocate paged KV cache sized from available GPU memory.
+        """Allocate paged KV cache.
 
-        Each layer gets its own PagedCache backed by
-            [num_blocks, block_size, n_kv_heads, d_head]
-        storage (the same layout nano-vllm uses).
-
-        num_blocks = clamp(
-            floor(available_bytes / bytes_per_layer_block),
-            lo = ceil(min_context / block_size),
-            hi = ceil(rope_max_context / block_size),   # never exceed rope limit
-        )
+        By default, allocate exactly enough blocks to satisfy min_context.
+        If gpu_memory_utilization is provided, use the previous auto-sizing mode
+        that grows the cache to consume a fraction of free GPU memory.
         """
         config = self.model.config
         n_kv_heads = config.num_key_value_heads
         d_head = config.head_dim
         num_layers = len(self.model.block)
         rope_max = self.model.block[0].attn.rope.max_context_length
-
-        free, total = torch.cuda.mem_get_info()
-        stats = torch.cuda.memory_stats()
-        peak    = stats.get("allocated_bytes.all.peak", 0)
-        current = stats.get("allocated_bytes.all.current", 0)
-        used = total - free
+        min_blocks = max(1, math.ceil(min_context / block_size))
 
         # Bytes for one block in one layer (K + V, bfloat16 = 2 bytes)
         bytes_per_layer_block = 2 * block_size * n_kv_heads * d_head * 2
-        available = int(total * gpu_memory_utilization - used - peak + current)
-        num_blocks = max(
-            math.ceil(min_context / block_size),
-            available // bytes_per_layer_block,
-        )
+
+        if gpu_memory_utilization is None:
+            num_blocks = min(min_blocks, math.ceil(rope_max / block_size))
+            mode_label = "exact context mode"
+        else:
+            free, total = torch.cuda.mem_get_info()
+            stats = torch.cuda.memory_stats()
+            peak = stats.get("allocated_bytes.all.peak", 0)
+            current = stats.get("allocated_bytes.all.current", 0)
+            used = total - free
+            available = int(total * gpu_memory_utilization - used - peak + current)
+            num_blocks = max(min_blocks, available // bytes_per_layer_block)
+            mode_label = f"auto mode ({gpu_memory_utilization:.2f} GPU mem)"
+
         # Never allocate more blocks than the model's RoPE can address
         num_blocks = min(num_blocks, math.ceil(rope_max / block_size))
 
         print(termcolor.colored(
-            f"KV cache: {num_blocks} blocks/layer × {block_size} tokens/block "
-            f"= {num_blocks * block_size:,} max context tokens "
-            f"(rope limit: {rope_max:,})",
+            f"KV cache: {mode_label}, {num_blocks} blocks/layer × {block_size} tokens/block "
+            f"= {num_blocks * block_size:,} max context tokens (rope limit: {rope_max:,}, "
+            f"{bytes_per_layer_block / 1024:.1f} KiB/block/layer)",
             "yellow",
         ), flush=True)
 
@@ -1245,6 +1260,13 @@ class TokenGenerator:
             return logits.argmax().item()
         probs = torch.softmax(logits.div_(temperature), dim=-1)
         return probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax().item()
+
+    def _prepare_decode_slots(self, decode_offset: int) -> None:
+        if decode_offset % self.block_size == 0:
+            for cache in self.caches:
+                cache.append_block()
+        for cache in self.caches:
+            cache.set_decode_slot(decode_offset)
 
     @torch.inference_mode()
     def generate(self,
@@ -1280,8 +1302,7 @@ class TokenGenerator:
                 with record_function("model_inference"):
                     self.input_token[0] = predicted_token
                     decode_offset = int(self.caches[0].offset.item())
-                    for cache in self.caches:
-                        cache.prepare_decode_slot(decode_offset)
+                    self._prepare_decode_slots(decode_offset)
                     self.graph.replay()
                     self.sample_next_token(self.logits, temperature)
             return
@@ -1291,8 +1312,7 @@ class TokenGenerator:
             # Single D2H sync: all caches share the same token position.
             # Pass the offset explicitly so each cache skips its own sync.
             decode_offset = int(self.caches[0].offset.item())
-            for cache in self.caches:
-                cache.prepare_decode_slot(decode_offset)
+            self._prepare_decode_slots(decode_offset)
             self.graph.replay()
             predicted_token = self.sample_next_token(self.logits, temperature)
             num_generated_tokens += 1
