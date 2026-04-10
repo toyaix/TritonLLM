@@ -2,9 +2,12 @@ import json
 import math
 import os
 import termcolor
+from collections import deque
 from dataclasses import dataclass
 
 import torch
+import triton
+import triton.language as tl
 from torch.profiler import profile, record_function, ProfilerActivity
 
 from gpt_oss.triton.weights import Checkpoint
@@ -252,40 +255,200 @@ class RotaryEmbedding(torch.nn.Module):
         return query, key
 
 
-class Cache:
-    def __init__(self, batch_size, n_ctx, n_kv_heads, d_head=64, device: torch.device | None = None):
-        self.k = torch.zeros((batch_size, n_ctx, n_kv_heads, d_head), dtype=torch.bfloat16, device=device)
-        self.v = torch.zeros((batch_size, n_ctx, n_kv_heads, d_head), dtype=torch.bfloat16, device=device)
+# ---------------------------------------------------------------------------
+# Paged KV-cache (nano-vllm approach)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _store_kvcache_kernel(
+    key_ptr, key_stride,
+    value_ptr, value_stride,
+    k_cache_ptr, v_cache_ptr,
+    slot_mapping_ptr,
+    D: tl.constexpr,
+):
+    """Scatter one token's K/V into a paged cache.
+
+    Each program handles one token. slot_mapping[idx] gives the flat slot
+    index into k_cache / v_cache viewed as [total_slots, D].
+    """
+    idx = tl.program_id(0)
+    slot = tl.load(slot_mapping_ptr + idx)
+    if slot == -1:
+        return
+    offsets = tl.arange(0, D)
+    key   = tl.load(key_ptr   + idx * key_stride   + offsets)
+    value = tl.load(value_ptr + idx * value_stride + offsets)
+    base  = slot.to(tl.int64) * D
+    tl.store(k_cache_ptr + base + offsets, key)
+    tl.store(v_cache_ptr + base + offsets, value)
+
+
+def store_kvcache(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Scatter key/value pairs into a paged KV cache.
+
+    Args:
+        key:          [N, n_kv_heads, head_dim]
+        value:        [N, n_kv_heads, head_dim]
+        k_cache:      [num_blocks, block_size, n_kv_heads, head_dim]
+        v_cache:      [num_blocks, block_size, n_kv_heads, head_dim]
+        slot_mapping: [N] int32 — flat slot index for each token
+                      (slot = block_id * block_size + offset_in_block)
+    """
+    N, num_heads, head_dim = key.shape
+    D = num_heads * head_dim
+    _store_kvcache_kernel[(N,)](
+        key,   key.stride(0),
+        value, value.stride(0),
+        k_cache, v_cache,
+        slot_mapping, D,
+    )
+
+
+class BlockManager:
+    """Paged KV-cache block allocator (per-layer, single sequence).
+
+    Physical layout of each layer's cache:
+        [num_blocks, block_size, n_kv_heads, head_dim]
+
+    A block_table maps logical block indices → physical block ids.
+    slot = block_table[pos // block_size] * block_size + pos % block_size
+    """
+
+    def __init__(self, num_blocks: int, block_size: int):
+        self.num_blocks = num_blocks
+        self.block_size = block_size
+        self._free: deque[int] = deque(range(num_blocks))
+
+    @property
+    def num_free_blocks(self) -> int:
+        return len(self._free)
+
+    @property
+    def capacity(self) -> int:
+        return self.num_blocks * self.block_size
+
+    def can_fit(self, num_tokens: int) -> bool:
+        needed = math.ceil(num_tokens / self.block_size)
+        return self.num_free_blocks >= needed
+
+    def append_block(self, block_table: list) -> None:
+        assert self._free, "KV cache exhausted: no free blocks available"
+        block_table.append(self._free.popleft())
+
+    def free(self, block_table: list) -> None:
+        for bid in block_table:
+            self._free.append(bid)
+
+
+class PagedCache:
+    """Per-layer KV cache with paged block management (nano-vllm approach).
+
+    Physical storage
+    ----------------
+    k / v : [num_blocks, block_size, n_kv_heads, d_head]   (stride(1) = D)
+
+    Kernel-compatible flat view
+    ---------------------------
+    k_flat / v_flat : [1, num_blocks * block_size, n_kv_heads, d_head]
+
+    The fused decode kernel and attention kernels receive k_flat / v_flat
+    unchanged — the existing strides are compatible because the underlying
+    storage is contiguous and the flat view has the same element order.
+    Unused slots contain zeros and are naturally masked out by causal
+    attention (via start_q / cu_seqlens).
+    """
+
+    def __init__(
+        self,
+        num_blocks: int,
+        block_size: int,
+        n_kv_heads: int,
+        d_head: int,
+        device: torch.device | None = None,
+    ):
+        self.n_kv_heads = n_kv_heads
+        self.d_head = d_head
+        self.block_manager = BlockManager(num_blocks, block_size)
+        self.k = torch.zeros(
+            (num_blocks, block_size, n_kv_heads, d_head),
+            dtype=torch.bfloat16, device=device,
+        )
+        self.v = torch.zeros(
+            (num_blocks, block_size, n_kv_heads, d_head),
+            dtype=torch.bfloat16, device=device,
+        )
+        self.block_table: list[int] = []
         self.offset = torch.zeros((1,), dtype=torch.long, device=device)
 
-    def reset(self):
-        self.k.zero_()
-        self.v.zero_()
+    @property
+    def block_size(self) -> int:
+        return self.block_manager.block_size
+
+    @property
+    def k_flat(self) -> torch.Tensor:
+        """[1, total_slots, n_kv_heads, d_head] — zero-copy view."""
+        nb, bs = self.block_manager.num_blocks, self.block_manager.block_size
+        return self.k.view(1, nb * bs, self.n_kv_heads, self.d_head)
+
+    @property
+    def v_flat(self) -> torch.Tensor:
+        nb, bs = self.block_manager.num_blocks, self.block_manager.block_size
+        return self.v.view(1, nb * bs, self.n_kv_heads, self.d_head)
+
+    def reset(self) -> None:
+        if self.block_table:
+            self.block_manager.free(self.block_table)
+            self.block_table = []
         self.offset.zero_()
 
-    def repeat_interleave(self, n):
-        """Repeat each cache entry n times along the batch dimension."""
-        self.k = self.k.repeat_interleave(n, dim=0)
-        self.v = self.v.repeat_interleave(n, dim=0)
+    def _slot(self, pos: int) -> int:
+        bs = self.block_size
+        return self.block_table[pos // bs] * bs + pos % bs
 
-    def truncate(self, n_ctx):
-        """Truncate the cache to the first n_ctx tokens."""
-        batch_size, _, n_kv_heads, d_head = self.k.shape
-        assert batch_size == self.v.shape[0]
-        assert n_ctx <= self.k.shape[1]
-        self.k[:, n_ctx:, :, :].zero_()
-        self.v[:, n_ctx:, :, :].zero_()
-        self.offset.fill_(n_ctx)
-        return self.k, self.v
+    def _ensure_blocks(self, length: int) -> None:
+        needed = math.ceil(length / self.block_size) if length > 0 else 0
+        while len(self.block_table) < needed:
+            self.block_manager.append_block(self.block_table)
 
-    def extend(self, k, v):
-        batch_size, n_ctx, *_rest = k.shape
-        assert batch_size == self.k.shape[0]
-        indices = torch.arange(0, n_ctx, device=k.device, dtype=torch.long) + self.offset
-        self.k.index_copy_(1, indices, k)
-        self.v.index_copy_(1, indices, v)
+    def extend(self, k: torch.Tensor, v: torch.Tensor):
+        """Scatter k, v [1, n_ctx, n_kv_heads, d_head] into the paged cache.
+
+        Returns a slice of k_flat / v_flat covering only the filled region
+        so prefill attention doesn't pay bandwidth for empty slots.
+        """
+        _, n_ctx, *_ = k.shape
+        offset = int(self.offset.item())
+        self._ensure_blocks(offset + n_ctx)
+        slots = [self._slot(offset + i) for i in range(n_ctx)]
+        slot_mapping = torch.tensor(slots, dtype=torch.int32, device=k.device)
+        store_kvcache(
+            k.view(n_ctx, self.n_kv_heads, self.d_head),
+            v.view(n_ctx, self.n_kv_heads, self.d_head),
+            self.k, self.v, slot_mapping,
+        )
         self.offset.add_(n_ctx)
-        return self.k, self.v
+        new_len = offset + n_ctx
+        return self.k_flat[:, :new_len], self.v_flat[:, :new_len]
+
+    def truncate(self, n_ctx: int):
+        """Truncate cache to n_ctx tokens, freeing excess blocks."""
+        bs = self.block_size
+        keep = math.ceil(n_ctx / bs) if n_ctx > 0 else 0
+        while len(self.block_table) > keep:
+            bid = self.block_table.pop()
+            self.block_manager.free([bid])
+        self.offset.fill_(n_ctx)
+        return self.k_flat, self.v_flat
+
+    def repeat_interleave(self, n: int) -> None:
+        raise NotImplementedError("repeat_interleave is not supported with PagedCache")
 
 
 class AttentionBlock(torch.nn.Module):
@@ -324,7 +487,7 @@ class AttentionBlock(torch.nn.Module):
         )
 
     @record_function("attn")
-    def forward(self, x: torch.Tensor, cache: Cache | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: PagedCache | None = None) -> torch.Tensor:
         batch_size, n_ctx, dim = x.shape
         fused_decode = False
 
@@ -645,7 +808,7 @@ class TransformerBlock(torch.nn.Module):
         self.attn = AttentionBlock(config, layer_idx, device)
         self.mlp = MLPBlock(config, layer_idx, device)
 
-    def forward(self, x: torch.Tensor, cache: Cache | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: PagedCache | None = None) -> torch.Tensor:
         x = self.attn(x, cache=cache)
         x = self.mlp(x)
         return x
@@ -672,7 +835,7 @@ class Transformer(torch.nn.Module):
         self.unembedding = UnEmbedding(config.hidden_size, config.vocab_size, device=device)
 
 
-    def forward(self, x: torch.Tensor, caches: list[Cache] | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, caches: list[PagedCache] | None = None) -> torch.Tensor:
         caches=caches or [None] * len(self.block)
         x = self.embedding(x)
         for block, cache in zip(self.block, caches):
@@ -747,7 +910,8 @@ class TokenGenerator:
         self.device = device
         print(termcolor.colored("Loading model checkpoint...", "yellow"), flush=True)
         self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
-        self.caches = [Cache(1, context, self.model.config.num_key_value_heads, device=self.device) for _ in range(len(self.model.block))]
+        # context hint is used as a minimum; actual allocation is GPU-memory driven
+        self.caches = self._allocate_kv_cache(min_context=context)
         self.input_token = torch.zeros(1, dtype=torch.int32, device=self.device)
         # warmup
         self.model(self.input_token[None, :], caches=self.caches)
@@ -755,6 +919,74 @@ class TokenGenerator:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
+
+    @property
+    def max_model_len(self) -> int:
+        """Maximum total sequence length (prompt + generated tokens).
+
+        Bounded by two independent limits that must both hold:
+          • GPU KV-cache capacity  — how many token slots we allocated
+          • RoPE max_context_length — positions beyond this have no valid
+            positional encoding and were not seen during training
+        One decode slot is reserved, so the usable prompt budget is
+        max_model_len - 1.
+        """
+        rope_max = self.model.block[0].attn.rope.max_context_length
+        kv_capacity = self.caches[0].block_manager.capacity
+        return min(rope_max, kv_capacity)
+
+    @torch.inference_mode()
+    def _allocate_kv_cache(
+        self,
+        min_context: int = 8192,
+        block_size: int = 256,
+        gpu_memory_utilization: float = 0.85,
+    ) -> list[PagedCache]:
+        """Allocate paged KV cache sized from available GPU memory.
+
+        Each layer gets its own PagedCache backed by
+            [num_blocks, block_size, n_kv_heads, d_head]
+        storage (the same layout nano-vllm uses).
+
+        num_blocks = clamp(
+            floor(available_bytes / bytes_per_layer_block),
+            lo = ceil(min_context / block_size),
+            hi = ceil(rope_max_context / block_size),   # never exceed rope limit
+        )
+        """
+        config = self.model.config
+        n_kv_heads = config.num_key_value_heads
+        d_head = config.head_dim
+        num_layers = len(self.model.block)
+        rope_max = self.model.block[0].attn.rope.max_context_length
+
+        free, total = torch.cuda.mem_get_info()
+        stats = torch.cuda.memory_stats()
+        peak    = stats.get("allocated_bytes.all.peak", 0)
+        current = stats.get("allocated_bytes.all.current", 0)
+        used = total - free
+
+        # Bytes for one block in one layer (K + V, bfloat16 = 2 bytes)
+        bytes_per_layer_block = 2 * block_size * n_kv_heads * d_head * 2
+        available = int(total * gpu_memory_utilization - used - peak + current)
+        num_blocks = max(
+            math.ceil(min_context / block_size),
+            available // bytes_per_layer_block,
+        )
+        # Never allocate more blocks than the model's RoPE can address
+        num_blocks = min(num_blocks, math.ceil(rope_max / block_size))
+
+        print(termcolor.colored(
+            f"KV cache: {num_blocks} blocks/layer × {block_size} tokens/block "
+            f"= {num_blocks * block_size:,} max context tokens "
+            f"(rope limit: {rope_max:,})",
+            "yellow",
+        ), flush=True)
+
+        return [
+            PagedCache(num_blocks, block_size, n_kv_heads, d_head, device=self.device)
+            for _ in range(num_layers)
+        ]
 
     @torch.inference_mode()
     def sample_next_token(self, logits: torch.Tensor, temperature: float) -> int:
@@ -774,6 +1006,14 @@ class TokenGenerator:
         stop_tokens = stop_tokens or []
         for cache in self.caches:
             cache.reset()
+        # max_model_len - 1: leave one slot for the first decode step
+        max_prompt = self.max_model_len - 1
+        if len(prompt_tokens) > max_prompt:
+            raise ValueError(
+                f"Prompt is too long: {len(prompt_tokens)} tokens "
+                f"exceeds max_model_len={self.max_model_len}. "
+                "Truncate the conversation history before calling generate()."
+            )
         prompt_tokens = torch.as_tensor(prompt_tokens, dtype=torch.int32, device=self.device)
         self.model(prompt_tokens[None, :-1], self.caches)
         predicted_token = prompt_tokens[-1]

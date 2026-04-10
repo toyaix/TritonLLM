@@ -263,8 +263,7 @@ class HarmonyChatTool:
 
         user_msg = Message.from_role_and_content(Role.USER, user_message)
         messages.append(user_msg)
-        conversation = Conversation.from_messages(messages)
-        tokens = self.encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+        tokens = self._render_with_truncation(messages)
 
         parser = StreamableParser(self.encoding, role=Role.ASSISTANT)
         current_output_text = ""
@@ -313,8 +312,7 @@ class HarmonyChatTool:
         user_msg = Message.from_role_and_content(Role.USER, user_message)
         messages.append(user_msg)
 
-        conversation = Conversation.from_messages(messages)
-        tokens = self.encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+        tokens = self._render_with_truncation(messages)
 
         token_num = 0
         for predicted_token in self.generator.generate(
@@ -323,6 +321,49 @@ class HarmonyChatTool:
             token_num += 1
 
         return max(0, token_num - 10)
+
+    def _render_with_truncation(self, messages: List[Message]) -> List[int]:
+        """Render conversation to tokens, truncating history if needed.
+
+        Strategy (mirrors nano-vllm's max_model_len enforcement):
+          1. Always keep base_messages (system prompt).
+          2. Always keep the last message (current user turn).
+          3. Drop oldest non-base messages from the middle until the
+             token count fits within max_model_len - 1 (one decode slot).
+
+        This preserves model behaviour (system prompt intact) while
+        gracefully handling long multi-turn conversations.
+        """
+        max_prompt = self.generator.max_model_len - 1
+
+        conversation = Conversation.from_messages(messages)
+        tokens = self.encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+        if len(tokens) <= max_prompt:
+            return tokens
+
+        # Identify which messages are "history" (between base and last)
+        base_count = len(self.base_messages)
+        history = list(messages[base_count:-1])   # mutable middle slice
+        last = messages[-1]
+
+        while history:
+            history.pop(0)   # drop oldest history turn first
+            trimmed = self.base_messages + history + [last]
+            conversation = Conversation.from_messages(trimmed)
+            tokens = self.encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+            if len(tokens) <= max_prompt:
+                return tokens
+
+        # Nothing left to drop — just the base + last message
+        trimmed = self.base_messages + [last]
+        conversation = Conversation.from_messages(trimmed)
+        tokens = self.encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+        if len(tokens) > max_prompt:
+            raise ValueError(
+                f"Even the system prompt + current user message ({len(tokens)} tokens) "
+                f"exceeds max_model_len={self.generator.max_model_len}."
+            )
+        return tokens
 
     def _process_tool_call(self, message: Message) -> List[Message]:
         """Process tool calls and return result messages"""
@@ -438,8 +479,7 @@ class HarmonyChatTool:
                             print(self.encoding.decode(rendered_result), flush=True, end="")
 
                         # Continue to generate assistant response
-                        conversation = Conversation.from_messages(messages)
-                        tokens = self.encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+                        tokens = self._render_with_truncation(messages)
 
                         if self.raw_mode:
                             print(self.encoding.decode(tokens[-2:]), flush=True, end="")
@@ -466,8 +506,7 @@ class HarmonyChatTool:
                     messages.append(user_msg)
 
                     # Generate assistant response
-                    conversation = Conversation.from_messages(messages)
-                    tokens = self.encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+                    tokens = self._render_with_truncation(messages)
 
                     if self.raw_mode:
                         print(self.encoding.decode(tokens[-2:]), flush=True, end="")
@@ -615,8 +654,7 @@ class HarmonyChatTool:
             # Silent inference for API use
             user_msg = Message.from_role_and_content(Role.USER, user_message)
             messages.append(user_msg)
-            conversation = Conversation.from_messages(messages)
-            tokens = self.encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+            tokens = self._render_with_truncation(messages)
 
             parser = StreamableParser(self.encoding, role=Role.ASSISTANT)
             output_text = ""
@@ -653,8 +691,7 @@ class ConversationSession:
             # Silent inference with history
             user_msg = Message.from_role_and_content(Role.USER, user_message)
             self.messages.append(user_msg)
-            conversation = Conversation.from_messages(self.messages)
-            tokens = self.chat_tool.encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+            tokens = self.chat_tool._render_with_truncation(self.messages)
 
             parser = StreamableParser(self.chat_tool.encoding, role=Role.ASSISTANT)
             response = ""
