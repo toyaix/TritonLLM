@@ -158,6 +158,8 @@ class OUT(torch.nn.Module):
 
 
 class RotaryEmbedding(torch.nn.Module):
+    _cos_sin_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
     def __init__(
         self,
         head_dim: int,
@@ -180,7 +182,29 @@ class RotaryEmbedding(torch.nn.Module):
         self.ntk_alpha = ntk_alpha
         self.ntk_beta = ntk_beta
         self.device = device
-        self.cos, self.sin = self._compute_cos_sin(0, self.max_context_length)
+        self.cos, self.sin = self._get_or_create_cos_sin()
+
+    def _cache_key(self) -> tuple:
+        return (
+            self.device.type if self.device is not None else None,
+            self.device.index if self.device is not None else None,
+            self.head_dim,
+            self.base,
+            self.dtype,
+            self.initial_context_length,
+            self.max_context_length,
+            self.scaling_factor,
+            self.ntk_alpha,
+            self.ntk_beta,
+        )
+
+    def _get_or_create_cos_sin(self) -> tuple[torch.Tensor, torch.Tensor]:
+        key = self._cache_key()
+        cached = self._cos_sin_cache.get(key)
+        if cached is None:
+            cached = self._compute_cos_sin(0, self.max_context_length)
+            self._cos_sin_cache[key] = cached
+        return cached
 
     def _compute_concentration_and_inv_freq(self) -> torch.Tensor:
         """See YaRN paper: https://arxiv.org/abs/2309.00071"""
