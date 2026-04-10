@@ -1232,11 +1232,19 @@ class TokenGenerator:
 
     @torch.inference_mode()
     def sample_next_token(self, logits: torch.Tensor, temperature: float) -> int:
-        """Executed only on rank 0."""
+        """Executed only on rank 0.
+
+        Uses the Gumbel-max trick instead of torch.multinomial:
+            argmax(probs / Exponential(1))  ~  Categorical(probs)
+
+        exponential_() + argmax() are pure GPU ops that compile/fuse cleanly,
+        whereas torch.multinomial requires a parallel prefix scan and is slower.
+        """
+        logits = logits[-1].float()
         if temperature == 0.0:
-            return torch.argmax(logits[-1, :], dim=-1).item()
-        probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
-        return torch.multinomial(probs[-1, :], num_samples=1).item()
+            return logits.argmax().item()
+        probs = torch.softmax(logits.div_(temperature), dim=-1)
+        return probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax().item()
 
     @torch.inference_mode()
     def generate(self,
