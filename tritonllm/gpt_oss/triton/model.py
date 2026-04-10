@@ -386,6 +386,10 @@ class PagedCache:
         )
         self.block_table: list[int] = []
         self.offset = torch.zeros((1,), dtype=torch.long, device=device)
+        # Pre-allocated slot tensor for decode steps (nano-vllm graph_vars pattern).
+        # Updated by prepare_decode_slot() *before* each graph.replay() so that
+        # the CUDA graph only sees pure GPU ops (no Python/D2H inside the graph).
+        self._decode_slot = torch.zeros((1,), dtype=torch.int32, device=device)
 
     @property
     def block_size(self) -> int:
@@ -417,25 +421,57 @@ class PagedCache:
         while len(self.block_table) < needed:
             self.block_manager.append_block(self.block_table)
 
+    def prepare_decode_slot(self) -> None:
+        """Compute and cache the slot for the next decode step.
+
+        Must be called on the CPU *before* every graph.replay() (and before
+        graph capture itself).  This mirrors nano-vllm's pattern of updating
+        graph_vars outside the CUDA graph so that the graph body contains only
+        pure GPU ops — no Python computation or D2H syncs.
+        """
+        offset = int(self.offset.item())   # D2H sync — only OK outside the graph
+        self._ensure_blocks(offset + 1)
+        self._decode_slot[0] = self._slot(offset)
+
     def extend(self, k: torch.Tensor, v: torch.Tensor):
         """Scatter k, v [1, n_ctx, n_kv_heads, d_head] into the paged cache.
 
-        Returns a slice of k_flat / v_flat covering only the filled region
-        so prefill attention doesn't pay bandwidth for empty slots.
+        Decode path (n_ctx == 1)
+        ------------------------
+        Uses the pre-allocated self._decode_slot tensor which was filled by
+        prepare_decode_slot() *outside* the CUDA graph.  No Python computation
+        or D2H syncs happen here — the body is fully graph-capturable.
+
+        Prefill path (n_ctx > 1)
+        ------------------------
+        Builds slot_mapping dynamically (fine; prefill is never graph-captured).
+        Returns a slice covering only the filled region so attention doesn't pay
+        memory-bandwidth for empty trailing slots.
         """
         _, n_ctx, *_ = k.shape
-        offset = int(self.offset.item())
-        self._ensure_blocks(offset + n_ctx)
-        slots = [self._slot(offset + i) for i in range(n_ctx)]
-        slot_mapping = torch.tensor(slots, dtype=torch.int32, device=k.device)
-        store_kvcache(
-            k.view(n_ctx, self.n_kv_heads, self.d_head),
-            v.view(n_ctx, self.n_kv_heads, self.d_head),
-            self.k, self.v, slot_mapping,
-        )
-        self.offset.add_(n_ctx)
-        new_len = offset + n_ctx
-        return self.k_flat[:, :new_len], self.v_flat[:, :new_len]
+        if n_ctx == 1:
+            # Decode: slot was pre-computed outside the graph
+            store_kvcache(
+                k.view(1, self.n_kv_heads, self.d_head),
+                v.view(1, self.n_kv_heads, self.d_head),
+                self.k, self.v, self._decode_slot,
+            )
+            self.offset.add_(1)
+            return self.k_flat, self.v_flat
+        else:
+            # Prefill: compute slot_mapping dynamically
+            offset = int(self.offset.item())
+            self._ensure_blocks(offset + n_ctx)
+            slots = [self._slot(offset + i) for i in range(n_ctx)]
+            slot_mapping = torch.tensor(slots, dtype=torch.int32, device=k.device)
+            store_kvcache(
+                k.view(n_ctx, self.n_kv_heads, self.d_head),
+                v.view(n_ctx, self.n_kv_heads, self.d_head),
+                self.k, self.v, slot_mapping,
+            )
+            self.offset.add_(n_ctx)
+            new_len = offset + n_ctx
+            return self.k_flat[:, :new_len], self.v_flat[:, :new_len]
 
     def truncate(self, n_ctx: int):
         """Truncate cache to n_ctx tokens, freeing excess blocks."""
@@ -913,9 +949,13 @@ class TokenGenerator:
         # context hint is used as a minimum; actual allocation is GPU-memory driven
         self.caches = self._allocate_kv_cache(min_context=context)
         self.input_token = torch.zeros(1, dtype=torch.int32, device=self.device)
-        # warmup
+        # warmup — prepare_decode_slot() fills _decode_slot before the forward pass
+        for cache in self.caches:
+            cache.prepare_decode_slot()
         self.model(self.input_token[None, :], caches=self.caches)
-        # capture for sampling
+        # capture — slot must be prepared before entering the graph region
+        for cache in self.caches:
+            cache.prepare_decode_slot()
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
@@ -1029,12 +1069,18 @@ class TokenGenerator:
             ) as prof:
                 with record_function("model_inference"):
                     self.input_token[0] = predicted_token
+                    for cache in self.caches:
+                        cache.prepare_decode_slot()
                     self.graph.replay()
                     self.sample_next_token(self.logits, temperature)
             return
 
         while max_tokens == 0 or num_generated_tokens < max_tokens:
             self.input_token[0] = predicted_token
+            # Compute next slot in Python (D2H sync) before GPU graph replay —
+            # mirrors nano-vllm's graph_vars update pattern.
+            for cache in self.caches:
+                cache.prepare_decode_slot()
             self.graph.replay()
             predicted_token = self.sample_next_token(self.logits, temperature)
             num_generated_tokens += 1
