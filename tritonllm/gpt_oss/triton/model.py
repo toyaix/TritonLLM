@@ -5,6 +5,9 @@ import termcolor
 from collections import deque
 from dataclasses import dataclass
 
+import numpy as np
+import xxhash as _xxhash
+
 import torch
 import triton
 import triton.language as tl
@@ -335,6 +338,25 @@ def store_kvcache(
     )
 
 
+class Block:
+    """A single physical KV-cache block with ref-counting and hash-based identity."""
+
+    def __init__(self, block_id: int):
+        self.block_id = block_id
+        self.ref_count = 0
+        self.hash = -1
+        self.token_ids: list[int] = []
+
+    def update(self, hash: int, token_ids: list[int]) -> None:
+        self.hash = hash
+        self.token_ids = token_ids
+
+    def reset(self) -> None:
+        self.ref_count = 1
+        self.hash = -1
+        self.token_ids = []
+
+
 class BlockManager:
     """Paged KV-cache block allocator (per-layer, single sequence).
 
@@ -343,16 +365,31 @@ class BlockManager:
 
     A block_table maps logical block indices → physical block ids.
     slot = block_table[pos // block_size] * block_size + pos % block_size
+
+    Supports hash-based prefix caching (requires xxhash) and ref-counted
+    block ownership for shared blocks between sequences.
     """
 
     def __init__(self, num_blocks: int, block_size: int):
         self.num_blocks = num_blocks
         self.block_size = block_size
-        self._free: deque[int] = deque(range(num_blocks))
+        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
+        self.hash_to_block_id: dict[int, int] = {}
+        self.free_block_ids: deque[int] = deque(range(num_blocks))
+        self.used_block_ids: set[int] = set()
+
+    @classmethod
+    def compute_hash(cls, token_ids: list[int], prefix: int = -1) -> int:
+        """Compute xxhash over token_ids chained with prefix hash."""
+        h = _xxhash.xxh64()
+        if prefix != -1:
+            h.update(prefix.to_bytes(8, "little"))
+        h.update(np.array(token_ids, dtype=np.int64).tobytes())
+        return h.intdigest()
 
     @property
     def num_free_blocks(self) -> int:
-        return len(self._free)
+        return len(self.free_block_ids)
 
     @property
     def capacity(self) -> int:
@@ -362,13 +399,130 @@ class BlockManager:
         needed = math.ceil(num_tokens / self.block_size)
         return self.num_free_blocks >= needed
 
-    def append_block(self, block_table: list) -> None:
-        assert self._free, "KV cache exhausted: no free blocks available"
-        block_table.append(self._free.popleft())
+    def _allocate_block(self, block_id: int) -> Block:
+        block = self.blocks[block_id]
+        assert block.ref_count == 0, f"block {block_id} is still in use (ref_count={block.ref_count})"
+        block.reset()
+        self.free_block_ids.remove(block_id)
+        self.used_block_ids.add(block_id)
+        return block
 
-    def free(self, block_table: list) -> None:
-        for bid in block_table:
-            self._free.append(bid)
+    def _deallocate_block(self, block_id: int) -> None:
+        assert self.blocks[block_id].ref_count == 0
+        self.used_block_ids.remove(block_id)
+        self.free_block_ids.append(block_id)
+
+    def allocate(self, token_ids: list[int], block_table: list[int]) -> int:
+        """Allocate blocks for token_ids, with prefix-cache hit detection.
+
+        Returns num_cached_tokens (tokens covered by cache-hit blocks).
+        block_table is populated in place.
+        """
+        assert not block_table, "block_table must be empty before allocate()"
+        num_tokens = len(token_ids)
+        num_full_blocks = num_tokens // self.block_size
+        has_partial = (num_tokens % self.block_size) != 0
+        total_blocks = num_full_blocks + (1 if has_partial else 0)
+
+        num_cached_tokens = 0
+        h = -1
+        cache_miss = False
+
+        for i in range(total_blocks):
+            start = i * self.block_size
+            end = min(start + self.block_size, num_tokens)
+            block_tokens = token_ids[start:end]
+            is_full = len(block_tokens) == self.block_size
+
+            # Only full blocks can be hashed / cached
+            block_hash = self.compute_hash(block_tokens, h) if is_full else -1
+            cached_bid = self.hash_to_block_id.get(block_hash, -1) if block_hash != -1 else -1
+
+            if cache_miss or cached_bid == -1 or self.blocks[cached_bid].token_ids != block_tokens:
+                cache_miss = True
+                bid = self.free_block_ids[0]
+                block = self._allocate_block(bid)
+            else:
+                # Prefix cache hit
+                num_cached_tokens += self.block_size
+                if cached_bid in self.used_block_ids:
+                    block = self.blocks[cached_bid]
+                    block.ref_count += 1
+                    bid = cached_bid
+                else:
+                    block = self._allocate_block(cached_bid)
+                    bid = cached_bid
+
+            if block_hash != -1:
+                block.update(block_hash, block_tokens)
+                self.hash_to_block_id[block_hash] = bid
+            h = block_hash
+            block_table.append(bid)
+
+        return num_cached_tokens
+
+    def deallocate(self, block_table: list[int]) -> None:
+        """Release blocks in block_table with ref-count semantics."""
+        for bid in reversed(block_table):
+            block = self.blocks[bid]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(bid)
+        block_table.clear()
+
+    def append_block(self, block_table: list[int]) -> None:
+        """Append a single new block to block_table (used during generation)."""
+        assert self.free_block_ids, "KV cache exhausted: no free blocks available"
+        bid = self.free_block_ids[0]
+        self._allocate_block(bid)
+        block_table.append(bid)
+
+    def finalize_block(self, block_table: list[int], token_ids: list[int]) -> None:
+        """Hash and register the last full block in block_table.
+
+        Call when the last block just became full (i.e., current position is
+        a multiple of block_size).  token_ids are the tokens in that block.
+        """
+        if not block_table:
+            return
+        last_bid = block_table[-1]
+        last_block = self.blocks[last_bid]
+        if last_block.hash != -1:
+            return  # already finalized
+        prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+        h = self.compute_hash(token_ids, prefix)
+        if h != -1:
+            last_block.update(h, token_ids)
+            self.hash_to_block_id[h] = last_bid
+
+    def can_append(self, current_len: int) -> bool:
+        """Return True if a decode step at current_len can proceed without OOM.
+
+        A new block is only needed when crossing a block boundary
+        (current_len % block_size == 0), i.e., the *next* token starts a
+        fresh block.  Otherwise the existing last block still has room.
+        """
+        needs_new_block = (current_len % self.block_size == 0)
+        return len(self.free_block_ids) >= (1 if needs_new_block else 0)
+
+    def may_append(self, block_table: list[int], token_ids_for_last_block: list[int], current_len: int) -> None:
+        """Ensure block_table has capacity for the token at current_len.
+
+        If current_len is at a block boundary, allocate a new block.
+        If current_len just *filled* a block (current_len % block_size == 0),
+        finalize (hash) the block that was just completed.
+        """
+        if current_len % self.block_size == 0:
+            # The previous block just became full — finalize it
+            if block_table:
+                self.finalize_block(block_table, token_ids_for_last_block)
+            # Also need a new block for the next token
+            self.append_block(block_table)
+        # else: still room in the current last block
+
+    def free(self, block_table: list[int]) -> None:
+        """Legacy free — delegates to deallocate for backward compatibility."""
+        self.deallocate(block_table)
 
 
 class PagedCache:
@@ -432,8 +586,8 @@ class PagedCache:
 
     def reset(self) -> None:
         if self.block_table:
-            self.block_manager.free(self.block_table)
-            self.block_table = []
+            self.block_manager.deallocate(self.block_table)
+            # deallocate() clears block_table in place
         self.offset.zero_()
 
     def _slot(self, pos: int) -> int:
@@ -503,7 +657,10 @@ class PagedCache:
         keep = math.ceil(n_ctx / bs) if n_ctx > 0 else 0
         while len(self.block_table) > keep:
             bid = self.block_table.pop()
-            self.block_manager.free([bid])
+            block = self.block_manager.blocks[bid]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self.block_manager._deallocate_block(bid)
         self.offset.fill_(n_ctx)
         return self.k_flat, self.v_flat
 
