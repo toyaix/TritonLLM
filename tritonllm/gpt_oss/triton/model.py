@@ -257,6 +257,12 @@ class Cache:
         self.k = torch.zeros((batch_size, n_ctx, n_kv_heads, d_head), dtype=torch.bfloat16, device=device)
         self.v = torch.zeros((batch_size, n_ctx, n_kv_heads, d_head), dtype=torch.bfloat16, device=device)
         self.offset = torch.zeros((1,), dtype=torch.long, device=device)
+        sliding_env = os.getenv("DENSE_CACHE_SLIDING", "1").strip().lower()
+        self.enable_sliding_window = sliding_env not in {"0", "false", "no", "off", ""}
+        default_slide_chunk = max(256, min(n_ctx // 8, 4096))
+        slide_chunk_env = os.getenv("DENSE_CACHE_SLIDE_CHUNK")
+        slide_chunk = int(slide_chunk_env) if slide_chunk_env is not None else default_slide_chunk
+        self.slide_chunk = max(1, min(slide_chunk, n_ctx - 1)) if n_ctx > 1 else 0
 
     def reset(self):
         self.k.zero_()
@@ -277,6 +283,28 @@ class Cache:
         self.v[:, n_ctx:, :, :].zero_()
         self.offset.fill_(n_ctx)
         return self.k, self.v
+
+    def can_slide(self) -> bool:
+        return self.enable_sliding_window and self.slide_chunk > 0
+
+    def slide_window(self, keep_last_n: int | None = None) -> int:
+        """Drop the oldest KV entries and keep only the most recent suffix."""
+        current = int(self.offset.item())
+        capacity = self.k.shape[1]
+        if current < capacity:
+            return current
+        if not self.can_slide():
+            return current
+        if keep_last_n is None:
+            keep_last_n = capacity - self.slide_chunk
+        keep_last_n = max(1, min(keep_last_n, capacity - 1, current))
+        start = current - keep_last_n
+        self.k[:, :keep_last_n].copy_(self.k[:, start:current])
+        self.v[:, :keep_last_n].copy_(self.v[:, start:current])
+        self.k[:, keep_last_n:, :, :].zero_()
+        self.v[:, keep_last_n:, :, :].zero_()
+        self.offset.fill_(keep_last_n)
+        return keep_last_n
 
     def extend(self, k, v):
         batch_size, n_ctx, *_rest = k.shape
@@ -748,6 +776,8 @@ class TokenGenerator:
         print(termcolor.colored("Loading model checkpoint...", "yellow"), flush=True)
         self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
         self.caches = [Cache(1, context, self.model.config.num_key_value_heads, device=self.device) for _ in range(len(self.model.block))]
+        self.enable_dense_cache_sliding = all(cache.can_slide() for cache in self.caches)
+        self._dense_slide_warned = False
         self.input_token = torch.zeros(1, dtype=torch.int32, device=self.device)
         # warmup
         self.model(self.input_token[None, :], caches=self.caches)
@@ -755,6 +785,21 @@ class TokenGenerator:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
+        if self.enable_dense_cache_sliding:
+            print(
+                termcolor.colored(
+                    f"Dense KV sliding enabled: evict {self.caches[0].slide_chunk} oldest tokens when full",
+                    "yellow",
+                ),
+                flush=True,
+            )
+
+    @property
+    def max_model_len(self) -> int:
+        """Maximum prompt length accepted by the dense KV cache path."""
+        rope_max = self.model.block[0].attn.rope.max_context_length
+        kv_capacity = self.caches[0].k.shape[1]
+        return min(rope_max, kv_capacity)
 
     @torch.inference_mode()
     def sample_next_token(self, logits: torch.Tensor, temperature: float) -> int:
@@ -763,6 +808,37 @@ class TokenGenerator:
             return torch.argmax(logits[-1, :], dim=-1).item()
         probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
         return torch.multinomial(probs[-1, :], num_samples=1).item()
+
+    def _handle_kv_capacity(self, decode_offset: int) -> tuple[bool, int]:
+        if decode_offset < self.max_model_len:
+            return True, decode_offset
+        if not self.enable_dense_cache_sliding:
+            print(
+                termcolor.colored(
+                    f"Decode stopped at max_model_len={self.max_model_len}",
+                    "yellow",
+                ),
+                flush=True,
+            )
+            return False, decode_offset
+
+        new_decode_offset = None
+        for cache in self.caches:
+            kept = cache.slide_window()
+            if new_decode_offset is None:
+                new_decode_offset = kept - 1
+            else:
+                assert new_decode_offset == kept - 1
+        if not self._dense_slide_warned:
+            self._dense_slide_warned = True
+            print(
+                termcolor.colored(
+                    f"Dense KV cache full at {self.max_model_len} tokens; sliding window reuse activated",
+                    "yellow",
+                ),
+                flush=True,
+            )
+        return True, new_decode_offset
 
     @torch.inference_mode()
     def generate(self,
@@ -774,9 +850,16 @@ class TokenGenerator:
         stop_tokens = stop_tokens or []
         for cache in self.caches:
             cache.reset()
+        if len(prompt_tokens) > self.max_model_len:
+            raise ValueError(
+                f"Prompt is too long: {len(prompt_tokens)} tokens "
+                f"exceeds max_model_len={self.max_model_len}. "
+                "Truncate the conversation history before calling generate()."
+            )
         prompt_tokens = torch.as_tensor(prompt_tokens, dtype=torch.int32, device=self.device)
         self.model(prompt_tokens[None, :-1], self.caches)
         predicted_token = prompt_tokens[-1]
+        decode_offset = prompt_tokens.numel() - 1
         num_generated_tokens = 0
         if os.getenv("profile", "0") == "1":
             print("DEBUG: You are currently in profiling mode. To disable, run `export profile=0`", flush=True)
@@ -788,15 +871,22 @@ class TokenGenerator:
                 with_stack=True
             ) as prof:
                 with record_function("model_inference"):
+                    can_continue, decode_offset = self._handle_kv_capacity(decode_offset)
+                    if not can_continue:
+                        return
                     self.input_token[0] = predicted_token
                     self.graph.replay()
                     self.sample_next_token(self.logits, temperature)
             return
 
         while max_tokens == 0 or num_generated_tokens < max_tokens:
+            can_continue, decode_offset = self._handle_kv_capacity(decode_offset)
+            if not can_continue:
+                break
             self.input_token[0] = predicted_token
             self.graph.replay()
             predicted_token = self.sample_next_token(self.logits, temperature)
+            decode_offset += 1
             num_generated_tokens += 1
 
             if return_logprobs:
