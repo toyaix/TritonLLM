@@ -449,6 +449,68 @@ class BlockManager:
 
 
 
+class DenseCache:
+    """Contiguous KV cache matching main branch behavior."""
+
+    def __init__(
+        self,
+        batch_size: int,
+        n_ctx: int,
+        n_kv_heads: int,
+        d_head: int = 64,
+        device: torch.device | None = None,
+    ):
+        self.k = torch.zeros(
+            (batch_size, n_ctx, n_kv_heads, d_head),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.v = torch.zeros(
+            (batch_size, n_ctx, n_kv_heads, d_head),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.offset = torch.zeros((1,), dtype=torch.long, device=device)
+
+    @property
+    def k_flat(self) -> torch.Tensor:
+        return self.k
+
+    @property
+    def v_flat(self) -> torch.Tensor:
+        return self.v
+
+    def append_block(self) -> None:
+        return None
+
+    def reset(self) -> None:
+        self.k.zero_()
+        self.v.zero_()
+        self.offset.zero_()
+
+    def repeat_interleave(self, n: int) -> None:
+        self.k = self.k.repeat_interleave(n, dim=0)
+        self.v = self.v.repeat_interleave(n, dim=0)
+
+    def truncate(self, n_ctx: int):
+        batch_size, _, n_kv_heads, d_head = self.k.shape
+        assert batch_size == self.v.shape[0]
+        assert n_ctx <= self.k.shape[1]
+        self.k[:, n_ctx:, :, :].zero_()
+        self.v[:, n_ctx:, :, :].zero_()
+        self.offset.fill_(n_ctx)
+        return self.k, self.v
+
+    def extend(self, k: torch.Tensor, v: torch.Tensor):
+        batch_size, n_ctx, *_rest = k.shape
+        assert batch_size == self.k.shape[0]
+        indices = torch.arange(0, n_ctx, device=k.device, dtype=torch.long) + self.offset
+        self.k.index_copy_(1, indices, k)
+        self.v.index_copy_(1, indices, v)
+        self.offset.add_(n_ctx)
+        return self.k, self.v
+
+
 class PagedCache:
     """Per-layer KV cache with paged block management (nano-vllm approach).
 
@@ -477,6 +539,7 @@ class PagedCache:
     ):
         self.n_kv_heads = n_kv_heads
         self.d_head = d_head
+        self.device = device
         self.block_manager = BlockManager(num_blocks, block_size)
         self.k = torch.zeros(
             (num_blocks, block_size, n_kv_heads, d_head),
@@ -491,10 +554,16 @@ class PagedCache:
         self.block_table: list[int] = []
         self.window_start = 0
         self.offset = torch.zeros((1,), dtype=torch.long, device=device)
+        self._offset_int = 0
         # Pre-allocated slot tensor for decode steps (nano-vllm graph_vars pattern).
         # Updated by prepare_decode_slot() *before* each graph.replay() so that
         # the CUDA graph only sees pure GPU ops (no Python/D2H inside the graph).
         self._decode_slot = torch.zeros((1,), dtype=torch.int32, device=device)
+        self._block_table_i32 = torch.empty((num_blocks,), dtype=torch.int32, device=device)
+        self._block_table_long = torch.empty((num_blocks,), dtype=torch.long, device=device)
+        self._block_table_dirty = False
+        self._position_indices = torch.empty((0,), dtype=torch.int32, device=device)
+        self._prefill_slot_mapping = torch.empty((0,), dtype=torch.int32, device=device)
 
     @property
     def block_size(self) -> int:
@@ -515,6 +584,8 @@ class PagedCache:
             # deallocate() clears block_table in place
         self.window_start = 0
         self.offset.zero_()
+        self._offset_int = 0
+        self._block_table_dirty = False
 
     def _slot(self, pos: int) -> int:
         bs = self.block_size
@@ -525,8 +596,40 @@ class PagedCache:
 
     def _visible_tokens(self, length: int | None = None) -> int:
         if length is None:
-            length = int(self.offset.item())
+            length = self._offset_int
         return max(0, length - self.window_start)
+
+    def _ensure_position_indices(self, length: int) -> None:
+        if self._position_indices.numel() >= length:
+            return
+        new_size = max(length, max(1024, self._position_indices.numel() * 2))
+        self._position_indices = torch.arange(
+            new_size,
+            dtype=torch.int32,
+            device=self.k.device,
+        )
+
+    def _ensure_prefill_slot_mapping(self, length: int) -> None:
+        if self._prefill_slot_mapping.numel() >= length:
+            return
+        new_size = max(length, max(1024, self._prefill_slot_mapping.numel() * 2))
+        self._prefill_slot_mapping = torch.empty(
+            (new_size,),
+            dtype=torch.int32,
+            device=self.k.device,
+        )
+
+    def _sync_block_table_device(self) -> tuple[torch.Tensor, torch.Tensor]:
+        num_blocks = len(self.block_table)
+        if num_blocks == 0:
+            return self._block_table_i32[:0], self._block_table_long[:0]
+        if self._block_table_dirty:
+            host_i32 = torch.tensor(self.block_table, dtype=torch.int32, device=self.k.device)
+            host_long = host_i32.to(torch.long)
+            self._block_table_i32[:num_blocks].copy_(host_i32)
+            self._block_table_long[:num_blocks].copy_(host_long)
+            self._block_table_dirty = False
+        return self._block_table_i32[:num_blocks], self._block_table_long[:num_blocks]
 
     def _logical_kv_view(self, length: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         visible_tokens = self._visible_tokens(length)
@@ -534,7 +637,7 @@ class PagedCache:
             empty_shape = (1, 0, self.n_kv_heads, self.d_head)
             return self.k.new_empty(empty_shape), self.v.new_empty(empty_shape)
 
-        block_order = torch.tensor(self.block_table, dtype=torch.long, device=self.k.device)
+        _, block_order = self._sync_block_table_device()
         k_view = self.k.index_select(0, block_order).view(1, -1, self.n_kv_heads, self.d_head)
         v_view = self.v.index_select(0, block_order).view(1, -1, self.n_kv_heads, self.d_head)
         return k_view[:, :visible_tokens], v_view[:, :visible_tokens]
@@ -548,6 +651,7 @@ class PagedCache:
         if block.ref_count == 0:
             self.block_manager._deallocate_block(oldest_bid)
         self.window_start += self.block_size
+        self._block_table_dirty = True
 
     def _ensure_blocks(self, length: int) -> None:
         capacity = self.block_manager.capacity
@@ -562,6 +666,7 @@ class PagedCache:
         if not self.block_manager.free_block_ids:
             self._evict_oldest_block()
         self.block_manager.append_block(self.block_table)
+        self._block_table_dirty = True
 
     def set_decode_slot(self, offset: int) -> None:
         self._decode_slot[0] = self._slot(offset)
@@ -606,24 +711,30 @@ class PagedCache:
                 v.view(1, self.n_kv_heads, self.d_head),
                 self.k, self.v, self._decode_slot,
             )
+            self._offset_int += 1
             self.offset.add_(1)
             return self._logical_kv_view()
         else:
             # Prefill: compute slot_mapping entirely on GPU (no Python loop)
-            offset = int(self.offset.item())
+            offset = self._offset_int
             self._ensure_blocks(offset + n_ctx)
             bs = self.block_size
-            # block_table is small (num_blocks entries); copy to GPU once
-            bt = torch.tensor(self.block_table, dtype=torch.int32, device=k.device)
-            positions = torch.arange(offset, offset + n_ctx, dtype=torch.int32, device=k.device)
-            local_positions = positions - self.window_start
-            slot_mapping = bt[local_positions // bs] * bs + local_positions % bs
+            bt, _ = self._sync_block_table_device()
+            local_offset = offset - self.window_start
+            self._ensure_position_indices(local_offset + n_ctx)
+            self._ensure_prefill_slot_mapping(n_ctx)
+            local_positions = self._position_indices[local_offset:local_offset + n_ctx]
+            slot_mapping = self._prefill_slot_mapping[:n_ctx]
+            slot_mapping.copy_(bt[local_positions // bs])
+            slot_mapping.mul_(bs)
+            slot_mapping.add_(local_positions.remainder(bs))
             store_kvcache(
                 k.view(n_ctx, self.n_kv_heads, self.d_head),
                 v.view(n_ctx, self.n_kv_heads, self.d_head),
                 self.k, self.v, slot_mapping,
             )
-            self.offset.add_(n_ctx)
+            self._offset_int = offset + n_ctx
+            self.offset.fill_(self._offset_int)
             new_len = offset + n_ctx
             return self._logical_kv_view(new_len)
 
@@ -639,11 +750,16 @@ class PagedCache:
                 bm.used_block_ids.remove(bid)
                 bm.free_block_ids.append(bid)
         self.window_start = min(self.window_start, n_ctx)
+        self._block_table_dirty = True
+        self._offset_int = n_ctx
         self.offset.fill_(n_ctx)
         return self._logical_kv_view(n_ctx)
 
     def repeat_interleave(self, n: int) -> None:
         raise NotImplementedError("repeat_interleave is not supported with PagedCache")
+
+
+KVCache = DenseCache | PagedCache
 
 
 class AttentionBlock(torch.nn.Module):
@@ -682,7 +798,7 @@ class AttentionBlock(torch.nn.Module):
         )
 
     @maybe_record_decorator("attn")
-    def forward(self, x: torch.Tensor, cache: PagedCache | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: KVCache | None = None) -> torch.Tensor:
         batch_size, n_ctx, dim = x.shape
         fused_decode = False
 
@@ -1003,7 +1119,7 @@ class TransformerBlock(torch.nn.Module):
         self.attn = AttentionBlock(config, layer_idx, device)
         self.mlp = MLPBlock(config, layer_idx, device)
 
-    def forward(self, x: torch.Tensor, cache: PagedCache | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: KVCache | None = None) -> torch.Tensor:
         x = self.attn(x, cache=cache)
         x = self.mlp(x)
         return x
@@ -1029,18 +1145,25 @@ class Transformer(torch.nn.Module):
         self.norm = RMSNorm(config.hidden_size, device=device)
         self.unembedding = UnEmbedding(config.hidden_size, config.vocab_size, device=device)
 
-
-    def forward(self, x: torch.Tensor, caches: list[PagedCache] | None = None) -> torch.Tensor:
-        caches=caches or [None] * len(self.block)
+    def _forward_hidden(
+        self,
+        x: torch.Tensor,
+        caches: list[KVCache] | None = None,
+    ) -> torch.Tensor:
+        caches = caches or [None] * len(self.block)
         x = self.embedding(x)
         for block, cache in zip(self.block, caches):
             x = block(x, cache=cache)
-        x = self.norm(x)
+        return self.norm(x)
+
+    def forward(self, x: torch.Tensor, caches: list[KVCache] | None = None) -> torch.Tensor:
+        x = self._forward_hidden(x, caches)
         x = self.unembedding(x)
         return x.float()
 
-    def prefill(self, x: torch.Tensor, caches):
-        self.forward(x, caches)
+    def prefill(self, x: torch.Tensor, caches: list[KVCache] | None = None) -> torch.Tensor:
+        """Populate KV cache for the prompt without paying vocab projection cost."""
+        return self._forward_hidden(x, caches)
 
     @staticmethod
     def from_checkpoint(
@@ -1111,13 +1234,17 @@ class TokenGenerator:
         self.device = device
         print(termcolor.colored("Loading model checkpoint...", "yellow"), flush=True)
         self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
+        cache_env = os.getenv("USE_PAGED_CACHE", "1").strip().lower()
+        self.use_paged_cache = cache_env not in {"0", "false", "no", "off", ""}
+        cache_mode = "paged" if self.use_paged_cache else "dense"
+        print(termcolor.colored(f"KV cache implementation: {cache_mode}", "yellow"), flush=True)
         # By default allocate exactly enough KV cache for the requested context.
         # Passing gpu_memory_utilization opts into the more aggressive auto-sizing mode.
         self.caches = self._allocate_kv_cache(
             min_context=context,
             gpu_memory_utilization=gpu_memory_utilization,
         )
-        self.block_size = self.caches[0].block_size
+        self.block_size = self.caches[0].block_size if self.use_paged_cache else 0
         self.input_token = torch.zeros(1, dtype=torch.int32, device=self.device)
         # Warm up and capture the single-token decode graph with the first block allocated.
         for cache in self.caches:
@@ -1140,7 +1267,10 @@ class TokenGenerator:
         max_model_len - 1.
         """
         rope_max = self.model.block[0].attn.rope.max_context_length
-        kv_capacity = self.caches[0].block_manager.capacity
+        if self.use_paged_cache:
+            kv_capacity = self.caches[0].block_manager.capacity
+        else:
+            kv_capacity = self.caches[0].k.shape[1]
         return min(rope_max, kv_capacity)
 
     @torch.inference_mode()
@@ -1149,7 +1279,7 @@ class TokenGenerator:
         min_context: int = 8192,
         block_size: int = 256,
         gpu_memory_utilization: float | None = None,
-    ) -> list[PagedCache]:
+    ) -> list[KVCache]:
         """Allocate paged KV cache.
 
         By default, allocate exactly enough blocks to satisfy min_context.
@@ -1161,6 +1291,19 @@ class TokenGenerator:
         d_head = config.head_dim
         num_layers = len(self.model.block)
         rope_max = self.model.block[0].attn.rope.max_context_length
+        if not self.use_paged_cache:
+            context = min(min_context, rope_max)
+            bytes_per_layer = 2 * context * n_kv_heads * d_head * 2
+            print(termcolor.colored(
+                f"KV cache: dense mode, {context:,} max context tokens "
+                f"(rope limit: {rope_max:,}, {bytes_per_layer / 1024 / 1024:.2f} MiB/layer)",
+                "yellow",
+            ), flush=True)
+            return [
+                DenseCache(1, context, n_kv_heads, d_head, device=self.device)
+                for _ in range(num_layers)
+            ]
+
         min_blocks = max(1, math.ceil(min_context / block_size))
 
         # Bytes for one block in one layer (K + V, bfloat16 = 2 bytes)
@@ -1206,6 +1349,8 @@ class TokenGenerator:
         return torch.multinomial(self._sampling_probs, num_samples=1).item()
 
     def _prepare_decode_slots(self, decode_offset: int) -> None:
+        if not self.use_paged_cache:
+            return
         if decode_offset % self.block_size == 0:
             for cache in self.caches:
                 cache.append_block()
@@ -1231,7 +1376,8 @@ class TokenGenerator:
         prompt_tokens = torch.as_tensor(prompt_tokens, dtype=torch.int32, device=self.device)
         predicted_token = prompt_tokens[-1]
         decode_offset = prompt_tokens.numel() - 1
-        self.model(prompt_tokens[None, :-1], self.caches)
+        if decode_offset > 0:
+            self.model.prefill(prompt_tokens[None, :-1], self.caches)
         num_generated_tokens = 0
 
         while max_tokens == 0 or num_generated_tokens < max_tokens:
