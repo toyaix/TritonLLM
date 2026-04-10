@@ -400,10 +400,28 @@ class BlockManager:
         return self.num_free_blocks >= needed
 
     def _allocate_block(self, block_id: int) -> Block:
+        """Allocate an arbitrary free block (O(n) deque scan).
+
+        Use only for prefix-cache hit paths where the target block is not
+        guaranteed to be at the front of free_block_ids.
+        """
         block = self.blocks[block_id]
         assert block.ref_count == 0, f"block {block_id} is still in use (ref_count={block.ref_count})"
         block.reset()
         self.free_block_ids.remove(block_id)
+        self.used_block_ids.add(block_id)
+        return block
+
+    def _allocate_first_free_block(self) -> Block:
+        """Allocate free_block_ids[0] in O(1) via popleft().
+
+        Use for all normal allocation paths where any free block will do.
+        """
+        assert self.free_block_ids, "KV cache exhausted: no free blocks available"
+        block_id = self.free_block_ids.popleft()
+        block = self.blocks[block_id]
+        assert block.ref_count == 0
+        block.reset()
         self.used_block_ids.add(block_id)
         return block
 
@@ -440,8 +458,8 @@ class BlockManager:
 
             if cache_miss or cached_bid == -1 or self.blocks[cached_bid].token_ids != block_tokens:
                 cache_miss = True
-                bid = self.free_block_ids[0]
-                block = self._allocate_block(bid)
+                block = self._allocate_first_free_block()
+                bid = block.block_id
             else:
                 # Prefix cache hit
                 num_cached_tokens += self.block_size
@@ -472,10 +490,8 @@ class BlockManager:
 
     def append_block(self, block_table: list[int]) -> None:
         """Append a single new block to block_table (used during generation)."""
-        assert self.free_block_ids, "KV cache exhausted: no free blocks available"
-        bid = self.free_block_ids[0]
-        self._allocate_block(bid)
-        block_table.append(bid)
+        block = self._allocate_first_free_block()
+        block_table.append(block.block_id)
 
     def finalize_block(self, block_table: list[int], token_ids: list[int]) -> None:
         """Hash and register the last full block in block_table.
@@ -599,15 +615,20 @@ class PagedCache:
         while len(self.block_table) < needed:
             self.block_manager.append_block(self.block_table)
 
-    def prepare_decode_slot(self) -> None:
+    def prepare_decode_slot(self, offset: int | None = None) -> None:
         """Compute and cache the slot for the next decode step.
 
         Must be called on the CPU *before* every graph.replay() (and before
         graph capture itself).  This mirrors nano-vllm's pattern of updating
         graph_vars outside the CUDA graph so that the graph body contains only
         pure GPU ops — no Python computation or D2H syncs.
+
+        offset: pass the already-known token position to avoid a D2H sync.
+                When None, falls back to self.offset.item() (only for
+                standalone callers such as warmup / graph-capture setup).
         """
-        offset = int(self.offset.item())   # D2H sync — only OK outside the graph
+        if offset is None:
+            offset = int(self.offset.item())   # D2H sync — only OK outside the graph
         self._ensure_blocks(offset + 1)
         self._decode_slot[0] = self._slot(offset)
 
@@ -1250,18 +1271,20 @@ class TokenGenerator:
             ) as prof:
                 with record_function("model_inference"):
                     self.input_token[0] = predicted_token
+                    decode_offset = int(self.caches[0].offset.item())
                     for cache in self.caches:
-                        cache.prepare_decode_slot()
+                        cache.prepare_decode_slot(decode_offset)
                     self.graph.replay()
                     self.sample_next_token(self.logits, temperature)
             return
 
         while max_tokens == 0 or num_generated_tokens < max_tokens:
             self.input_token[0] = predicted_token
-            # Compute next slot in Python (D2H sync) before GPU graph replay —
-            # mirrors nano-vllm's graph_vars update pattern.
+            # Single D2H sync: all caches share the same token position.
+            # Pass the offset explicitly so each cache skips its own sync.
+            decode_offset = int(self.caches[0].offset.item())
             for cache in self.caches:
-                cache.prepare_decode_slot()
+                cache.prepare_decode_slot(decode_offset)
             self.graph.replay()
             predicted_token = self.sample_next_token(self.logits, temperature)
             num_generated_tokens += 1
