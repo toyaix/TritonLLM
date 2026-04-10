@@ -281,6 +281,7 @@ class HarmonyChatTool:
         user_msg = Message.from_role_and_content(Role.USER, user_message)
         messages.append(user_msg)
         tokens = self._render_with_truncation(messages)
+        max_tokens = self._resolve_max_tokens(tokens, 0)
 
         parser = StreamableParser(self.encoding, role=Role.ASSISTANT)
         current_output_text = ""
@@ -290,7 +291,7 @@ class HarmonyChatTool:
         token_num = 0
 
         for predicted_token in self.generator.generate(
-            tokens, self.encoding.stop_tokens_for_assistant_actions()
+            tokens, self.encoding.stop_tokens_for_assistant_actions(), max_tokens=max_tokens
         ):
             token_num += 1
             parser.process(predicted_token)
@@ -330,6 +331,7 @@ class HarmonyChatTool:
         messages.append(user_msg)
 
         tokens = self._render_with_truncation(messages)
+        max_tokens = self._resolve_max_tokens(tokens, max_tokens)
 
         token_num = 0
         for predicted_token in self.generator.generate(
@@ -338,6 +340,13 @@ class HarmonyChatTool:
             token_num += 1
 
         return max(0, token_num - 10)
+
+    def _resolve_max_tokens(self, tokens: List[int], requested_max_tokens: int) -> int:
+        """Clamp generation length to the remaining decode budget."""
+        remaining_budget = max(0, self.generator.max_model_len - len(tokens))
+        if requested_max_tokens <= 0:
+            return remaining_budget
+        return min(requested_max_tokens, remaining_budget)
 
     def _render_with_truncation(self, messages: List[Message]) -> List[int]:
         """Render conversation to tokens, truncating history if needed.
@@ -547,8 +556,13 @@ class HarmonyChatTool:
         output_text_delta_buffer = ""
         token_begin = time.perf_counter()
         token_num = 0
+        max_tokens = self._resolve_max_tokens(tokens, 0)
 
-        for predicted_token in self.generator.generate(tokens, self.encoding.stop_tokens_for_assistant_actions()):
+        for predicted_token in self.generator.generate(
+            tokens,
+            self.encoding.stop_tokens_for_assistant_actions(),
+            max_tokens=max_tokens,
+        ):
             token_num += 1
             parser.process(predicted_token)
 
@@ -611,6 +625,7 @@ class HarmonyChatTool:
         prompt_files: List[str] = None,
         warmup_prompts_per_file: int = 1,
         warmup_max_tokens: int = 16,
+        benchmark_max_tokens: int = 0,
     ):
         """Run benchmark mode"""
         if prompt_files is None:
@@ -646,7 +661,11 @@ class HarmonyChatTool:
 
                 token_begin = time.perf_counter()
                 messages = self.base_messages.copy()
-                token_num = self._benchmark_inference(user_message, messages)
+                token_num = self._benchmark_inference(
+                    user_message,
+                    messages,
+                    max_tokens=benchmark_max_tokens,
+                )
                 elapsed = time.perf_counter() - token_begin
 
                 time_sum += elapsed
@@ -678,12 +697,15 @@ class HarmonyChatTool:
             user_msg = Message.from_role_and_content(Role.USER, user_message)
             messages.append(user_msg)
             tokens = self._render_with_truncation(messages)
+            max_tokens = self._resolve_max_tokens(tokens, 0)
 
             parser = StreamableParser(self.encoding, role=Role.ASSISTANT)
             output_text = ""
 
             for predicted_token in self.generator.generate(
-                tokens, self.encoding.stop_tokens_for_assistant_actions()
+                tokens,
+                self.encoding.stop_tokens_for_assistant_actions(),
+                max_tokens=max_tokens,
             ):
                 parser.process(predicted_token)
                 if parser.last_content_delta:
@@ -715,12 +737,15 @@ class ConversationSession:
             user_msg = Message.from_role_and_content(Role.USER, user_message)
             self.messages.append(user_msg)
             tokens = self.chat_tool._render_with_truncation(self.messages)
+            max_tokens = self.chat_tool._resolve_max_tokens(tokens, 0)
 
             parser = StreamableParser(self.chat_tool.encoding, role=Role.ASSISTANT)
             response = ""
 
             for predicted_token in self.chat_tool.generator.generate(
-                tokens, self.chat_tool.encoding.stop_tokens_for_assistant_actions()
+                tokens,
+                self.chat_tool.encoding.stop_tokens_for_assistant_actions(),
+                max_tokens=max_tokens,
             ):
                 parser.process(predicted_token)
                 if parser.last_content_delta:

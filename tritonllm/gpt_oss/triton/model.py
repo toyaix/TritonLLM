@@ -3,15 +3,15 @@ import json
 import math
 import os
 import struct
-import time
 import termcolor
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
 import triton
 import triton.language as tl
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import record_function
 
 from gpt_oss.triton.weights import Checkpoint
 from gpt_oss.triton.attention_ref import attention_ref
@@ -32,6 +32,24 @@ from gpt_oss.triton.triton_kernels import (
     rope_forward,
     unembedding_decode_forward,
 )
+
+ENABLE_RECORD_FUNCTION = os.getenv("ENABLE_RECORD_FUNCTION", "0") == "1"
+
+
+def maybe_record_function(name: str):
+    if ENABLE_RECORD_FUNCTION:
+        return record_function(name)
+    return nullcontext()
+
+
+def maybe_record_decorator(name: str):
+    if ENABLE_RECORD_FUNCTION:
+        return record_function(name)
+
+    def decorator(fn):
+        return fn
+
+    return decorator
 
 @dataclass
 class ModelConfig:
@@ -63,7 +81,7 @@ class RMSNorm(torch.nn.Module):
             torch.ones(num_features, device=device, dtype=torch.float32)
         )
 
-    @record_function("rmsnorm_triton")
+    @maybe_record_decorator("rmsnorm_triton")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return rmsnorm_forward(x, self.scale, self.eps)
 
@@ -77,7 +95,7 @@ class UnEmbedding(torch.nn.Module):
             torch.empty((vocab_size, hidden_size), device=device, dtype=torch.bfloat16)
         )
 
-    @record_function("unembedding_linear")
+    @maybe_record_decorator("unembedding_linear")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
             x.is_cuda
@@ -102,11 +120,11 @@ class QKV(torch.nn.Module):
             torch.empty((qkv_dim), device=device, dtype=torch.bfloat16)
         )
 
-    @record_function("qkv_linear")
+    @maybe_record_decorator("qkv_linear")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.linear(x, self.weight, self.bias)
 
-    @record_function("qkv_linear_decode")
+    @maybe_record_decorator("qkv_linear_decode")
     def decode(
         self,
         x: torch.Tensor,
@@ -140,11 +158,11 @@ class OUT(torch.nn.Module):
             torch.empty((hidden_size), device=device, dtype=torch.bfloat16)
         )
 
-    @record_function("out_linear")
+    @maybe_record_decorator("out_linear")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.linear(x, self.weight, self.bias)
 
-    @record_function("out_linear_decode")
+    @maybe_record_decorator("out_linear_decode")
     def decode_residual(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         if (
             x.is_cuda
@@ -257,7 +275,7 @@ class RotaryEmbedding(torch.nn.Module):
         sin = freqs.sin() * concentration
         return cos, sin
 
-    @record_function("rotate")
+    @maybe_record_decorator("rotate")
     def _rotate(
         self,
         x: torch.Tensor,
@@ -271,7 +289,7 @@ class RotaryEmbedding(torch.nn.Module):
         o2 = x2 * cos + x1 * sin
         return torch.cat((o1, o2), dim=-1)
 
-    @record_function("rope_triton")
+    @maybe_record_decorator("rope_triton")
     def forward(
         self,
         query: torch.Tensor,
@@ -663,13 +681,13 @@ class AttentionBlock(torch.nn.Module):
             device=device,
         )
 
-    @record_function("attn")
+    @maybe_record_decorator("attn")
     def forward(self, x: torch.Tensor, cache: PagedCache | None = None) -> torch.Tensor:
         batch_size, n_ctx, dim = x.shape
         fused_decode = False
 
         t = self.norm(x)
-        with record_function("qkv"):
+        with maybe_record_function("qkv"):
             q_dim = self.num_attention_heads * self.head_dim
             kv_dim = self.num_key_value_heads * self.head_dim
             if (
@@ -724,7 +742,7 @@ class AttentionBlock(torch.nn.Module):
             self.num_attention_heads // self.num_key_value_heads,
             self.head_dim,
         )
-        with record_function("attn_kernel"):
+        with maybe_record_function("attn_kernel"):
             if cache is not None and n_ctx == 1:
                 t = attention_decode(
                     q,
@@ -756,7 +774,7 @@ class AttentionBlock(torch.nn.Module):
                     offset,
                 )
 
-        with record_function("c_proj"):
+        with maybe_record_function("c_proj"):
             if fused_decode:
                 t = self.out.decode_residual(t, x)
                 cache.offset.add_(1)
@@ -928,7 +946,7 @@ class MLPBlock(torch.nn.Module):
             "_mlp2_bias_fp32_version",
         )
 
-    @record_function("mlp")
+    @maybe_record_decorator("mlp")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, n_ctx, dim = x.shape
         t = self.norm(x)
@@ -1192,183 +1210,6 @@ class TokenGenerator:
             for cache in self.caches:
                 cache.append_block()
 
-    @staticmethod
-    def _profile_env_flag(name: str, default: bool = False) -> bool:
-        value = os.getenv(name)
-        if value is None:
-            return default
-        return value.strip().lower() not in {"0", "false", "no", "off", ""}
-
-    @staticmethod
-    def _profile_env_int(name: str, default: int) -> int:
-        value = os.getenv(name)
-        if value is None:
-            return default
-        return int(value)
-
-    def _build_profiler(
-        self,
-        trace_subdir: str,
-        *,
-        wait: int,
-        warmup: int,
-        active: int,
-        repeat: int,
-    ):
-        profile_root = os.getenv("profile_dir", "./log_dir")
-        profile_dir = os.path.join(profile_root, trace_subdir)
-        record_shapes = self._profile_env_flag("profile_record_shapes", True)
-        with_stack = self._profile_env_flag("profile_with_stack", True)
-        profile_memory = self._profile_env_flag("profile_memory", False)
-
-        profiler = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(
-                wait=wait,
-                warmup=warmup,
-                active=active,
-                repeat=repeat,
-            ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(profile_dir),
-            record_shapes=record_shapes,
-            with_stack=with_stack,
-            profile_memory=profile_memory,
-        )
-        return profiler, profile_dir, wait, warmup, active, repeat
-
-    def _print_profile_summary(self, prof) -> None:
-        row_limit = self._profile_env_int("profile_row_limit", 30)
-        sort_by = os.getenv("profile_sort_by", "cuda_time_total")
-        try:
-            table = prof.key_averages().table(sort_by=sort_by, row_limit=row_limit)
-        except RuntimeError:
-            table = prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=row_limit)
-        print(table, flush=True)
-
-    def _print_decode_timing(self, num_tokens: int, elapsed: float) -> None:
-        if num_tokens <= 0 or elapsed <= 0:
-            return
-        avg_ms = elapsed * 1000.0 / num_tokens
-        tps = num_tokens / elapsed
-        print(
-            termcolor.colored(
-                f"Profiled decode: {num_tokens} tokens in {elapsed:.3f}s | "
-                f"{avg_ms:.3f} ms/token | {tps:.3f} tokens/s",
-                "yellow",
-            ),
-            flush=True,
-        )
-
-    def _profile_generate(
-        self,
-        prompt_tokens: torch.Tensor,
-        predicted_token: torch.Tensor,
-        decode_offset: int,
-        stop_tokens: list[int],
-        temperature: float,
-        max_tokens: int,
-        return_logprobs: bool,
-    ):
-        profile_prefill = self._profile_env_flag("profile_prefill", True)
-        default_decode_steps = max_tokens if max_tokens > 0 else 16
-        profile_steps = self._profile_env_int("profile_steps", default_decode_steps)
-        profile_steps = max(1, profile_steps)
-        decode_wait = self._profile_env_int("profile_wait", 0)
-        decode_warmup = self._profile_env_int("profile_warmup", 1)
-        decode_active = self._profile_env_int("profile_active", 4)
-        decode_repeat = self._profile_env_int("profile_repeat", 1)
-
-        profile_root = os.getenv("profile_dir", "./log_dir")
-        prefill_dir = os.path.join(profile_root, "prefill")
-        decode_dir = os.path.join(profile_root, "decode")
-        print(
-            termcolor.colored(
-                f"DEBUG: profiling enabled | prefill_trace={prefill_dir} | decode_trace={decode_dir} "
-                f"(prefill={'on' if profile_prefill else 'off'}, decode_steps={profile_steps}, "
-                f"decode_schedule=wait:{decode_wait}, warmup:{decode_warmup}, "
-                f"active:{decode_active}, repeat:{decode_repeat})",
-                "yellow",
-            ),
-            flush=True,
-        )
-
-        num_generated_tokens = 0
-        if profile_prefill:
-            prefill_profiler, _, _, _, _, _ = self._build_profiler(
-                "prefill",
-                wait=0,
-                warmup=0,
-                active=1,
-                repeat=1,
-            )
-            with prefill_profiler as prof:
-                if self.device.type == "cuda":
-                    torch.cuda.synchronize(self.device)
-                prefill_start = time.perf_counter()
-                with record_function("prefill"):
-                    self.model(prompt_tokens[None, :-1], self.caches)
-                if self.device.type == "cuda":
-                    torch.cuda.synchronize(self.device)
-                prefill_elapsed = time.perf_counter() - prefill_start
-                prof.step()
-            print(
-                termcolor.colored(
-                    f"Profiled prefill: {max(0, prompt_tokens.numel() - 1)} tokens in {prefill_elapsed:.3f}s",
-                    "yellow",
-                ),
-                flush=True,
-            )
-            self._print_profile_summary(prefill_profiler)
-
-        decode_profiler, _, _, _, _, _ = self._build_profiler(
-            "decode",
-            wait=decode_wait,
-            warmup=decode_warmup,
-            active=decode_active,
-            repeat=decode_repeat,
-        )
-        with decode_profiler as prof:
-            if self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)
-            decode_start = time.perf_counter()
-            while num_generated_tokens < profile_steps:
-                if decode_offset >= self.max_model_len:
-                    print(
-                        termcolor.colored(
-                            f"Decode profiling stopped at max_model_len={self.max_model_len}",
-                            "yellow",
-                        ),
-                        flush=True,
-                    )
-                    break
-                with record_function("decode_step"):
-                    self.input_token[0] = predicted_token
-                    with record_function("prepare_decode_slots"):
-                        self._prepare_decode_slots(decode_offset)
-                    with record_function("graph_replay"):
-                        self.graph.replay()
-                    with record_function("sample_next_token"):
-                        predicted_token = self.sample_next_token(self.logits, temperature)
-                    decode_offset += 1
-                num_generated_tokens += 1
-                prof.step()
-
-                if return_logprobs:
-                    logprobs = torch.log_softmax(self.logits[-1, :], dim=-1)
-                    selected_logprobs = logprobs[predicted_token].item()
-                    yield predicted_token, selected_logprobs
-                else:
-                    yield predicted_token
-
-                if predicted_token in stop_tokens:
-                    break
-            if self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)
-            decode_elapsed = time.perf_counter() - decode_start
-
-        self._print_decode_timing(num_generated_tokens, decode_elapsed)
-        self._print_profile_summary(decode_profiler)
-
     @torch.inference_mode()
     def generate(self,
                  prompt_tokens: list[int],
@@ -1390,26 +1231,11 @@ class TokenGenerator:
         prompt_tokens = torch.as_tensor(prompt_tokens, dtype=torch.int32, device=self.device)
         predicted_token = prompt_tokens[-1]
         decode_offset = prompt_tokens.numel() - 1
-        profile_enabled = self._profile_env_flag("profile", False)
-        profile_prefill = self._profile_env_flag("profile_prefill", True)
-        if profile_enabled:
-            if not profile_prefill:
-                self.model(prompt_tokens[None, :-1], self.caches)
-            yield from self._profile_generate(
-                prompt_tokens,
-                predicted_token,
-                decode_offset,
-                stop_tokens,
-                temperature,
-                max_tokens,
-                return_logprobs,
-            )
-            return
         self.model(prompt_tokens[None, :-1], self.caches)
         num_generated_tokens = 0
 
         while max_tokens == 0 or num_generated_tokens < max_tokens:
-            if decode_offset >= self.max_model_len:
+            if decode_offset + 1 >= self.max_model_len:
                 print(
                     termcolor.colored(
                         f"Decode stopped at max_model_len={self.max_model_len}",
