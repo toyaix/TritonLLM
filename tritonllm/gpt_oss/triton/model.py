@@ -664,11 +664,14 @@ class PagedCache:
             self.offset.add_(1)
             return self.k_flat, self.v_flat
         else:
-            # Prefill: compute slot_mapping dynamically
+            # Prefill: compute slot_mapping entirely on GPU (no Python loop)
             offset = int(self.offset.item())
             self._ensure_blocks(offset + n_ctx)
-            slots = [self._slot(offset + i) for i in range(n_ctx)]
-            slot_mapping = torch.tensor(slots, dtype=torch.int32, device=k.device)
+            bs = self.block_size
+            # block_table is small (num_blocks entries); copy to GPU once
+            bt = torch.tensor(self.block_table, dtype=torch.int32, device=k.device)
+            positions = torch.arange(offset, offset + n_ctx, dtype=torch.int32, device=k.device)
+            slot_mapping = bt[positions // bs] * bs + positions % bs
             store_kvcache(
                 k.view(n_ctx, self.n_kv_heads, self.d_head),
                 v.view(n_ctx, self.n_kv_heads, self.d_head),
