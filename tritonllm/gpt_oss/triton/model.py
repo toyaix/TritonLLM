@@ -546,8 +546,8 @@ class AttentionBlock(torch.nn.Module):
                     self.rope.sin,
                     self.rope.cos,
                     self.rope.max_context_length,
-                    cache.k,
-                    cache.v,
+                    cache.k_flat,
+                    cache.v_flat,
                     offset,
                     self.num_attention_heads,
                     self.num_key_value_heads,
@@ -561,8 +561,8 @@ class AttentionBlock(torch.nn.Module):
 
         q = q.view(batch_size, n_ctx, self.num_attention_heads, self.head_dim)
         if fused_decode:
-            k = cache.k
-            v = cache.v
+            k = cache.k_flat
+            v = cache.v_flat
         else:
             k = k.view(batch_size, n_ctx, self.num_key_value_heads, self.head_dim)
             v = v.view(batch_size, n_ctx, self.num_key_value_heads, self.head_dim)
