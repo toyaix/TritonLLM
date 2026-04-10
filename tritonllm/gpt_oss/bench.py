@@ -8,6 +8,7 @@ import time
 import random
 import os
 import asyncio
+from collections import deque
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -359,12 +360,12 @@ class HarmonyChatTool:
 
         # Identify which messages are "history" (between base and last)
         base_count = len(self.base_messages)
-        history = list(messages[base_count:-1])   # mutable middle slice
+        history = deque(messages[base_count:-1])  # O(1) popleft
         last = messages[-1]
 
         while history:
-            history.pop(0)   # drop oldest history turn first
-            trimmed = self.base_messages + history + [last]
+            history.popleft()   # drop oldest history turn first
+            trimmed = self.base_messages + list(history) + [last]
             conversation = Conversation.from_messages(trimmed)
             tokens = self.encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
             if len(tokens) <= max_prompt:
