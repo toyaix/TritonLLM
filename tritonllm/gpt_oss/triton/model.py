@@ -749,7 +749,7 @@ class AttentionBlock(torch.nn.Module):
                 and t.dtype == torch.bfloat16
             ):
                 fused_decode = True
-                offset = cache.offset.clone()
+                offset = cache.offset
                 q = qkv_rope_cache_decode_forward(
                     t,
                     self.qkv.weight,
@@ -764,7 +764,6 @@ class AttentionBlock(torch.nn.Module):
                     self.num_key_value_heads,
                     self.head_dim,
                 )
-                cache.offset.add_(1)
             else:
                 qkv = self.qkv(t)
                 q, k, v = torch.split(qkv, (q_dim, kv_dim, kv_dim), dim=-1)
@@ -830,6 +829,7 @@ class AttentionBlock(torch.nn.Module):
         with record_function("c_proj"):
             if fused_decode:
                 t = self.out.decode_residual(t, x)
+                cache.offset.add_(1)
             else:
                 t = self.out(t)
                 t = x + t
@@ -1181,6 +1181,8 @@ class TokenGenerator:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
+        self._sampling_probs = torch.empty_like(self.logits[0])
+        self._sampling_noise = torch.empty_like(self.logits[0])
 
     @property
     def max_model_len(self) -> int:
@@ -1258,11 +1260,14 @@ class TokenGenerator:
         exponential_() + argmax() are pure GPU ops that compile/fuse cleanly,
         whereas torch.multinomial requires a parallel prefix scan and is slower.
         """
-        logits = logits[-1].float()
+        logits = logits[-1]
         if temperature == 0.0:
             return logits.argmax().item()
-        probs = torch.softmax(logits.div_(temperature), dim=-1)
-        return probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax().item()
+        self._sampling_probs.copy_(logits)
+        self._sampling_probs.div_(temperature)
+        torch.softmax(self._sampling_probs, dim=-1, out=self._sampling_probs)
+        self._sampling_noise.exponential_().clamp_min_(1e-10)
+        return self._sampling_probs.div_(self._sampling_noise).argmax().item()
 
     def _prepare_decode_slots(self, decode_offset: int) -> None:
         if decode_offset % self.block_size == 0:
