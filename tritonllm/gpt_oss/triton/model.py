@@ -288,6 +288,8 @@ class Cache:
         slide_chunk_env = os.getenv("DENSE_CACHE_SLIDE_CHUNK")
         slide_chunk = int(slide_chunk_env) if slide_chunk_env is not None else default_slide_chunk
         self.slide_chunk = max(1, min(slide_chunk, n_ctx - 1)) if n_ctx > 1 else 0
+        self._slide_k = self._slide_v = None
+        self._ensure_slide_buffers()
 
     def reset(self):
         self.k.zero_()
@@ -298,6 +300,7 @@ class Cache:
         """Repeat each cache entry n times along the batch dimension."""
         self.k = self.k.repeat_interleave(n, dim=0)
         self.v = self.v.repeat_interleave(n, dim=0)
+        self._ensure_slide_buffers()
 
     def truncate(self, n_ctx):
         """Truncate the cache to the first n_ctx tokens."""
@@ -312,9 +315,27 @@ class Cache:
     def can_slide(self) -> bool:
         return self.enable_sliding_window and self.slide_chunk > 0
 
-    def slide_window(self, keep_last_n: int | None = None) -> int:
-        """Drop the oldest KV entries and keep only the most recent suffix."""
-        current = int(self.offset.item())
+    def _ensure_slide_buffers(self) -> None:
+        """Keep the sliding-window staging buffers in sync with the KV cache."""
+        if not self.can_slide():
+            self._slide_k = self._slide_v = None
+            return
+
+        shape = (self.k.shape[0], self.slide_chunk, self.k.shape[2], self.k.shape[3])
+        if self._slide_k is not None and self._slide_k.shape == shape:
+            return
+
+        self._slide_k = self.k.new_empty(shape)
+        self._slide_v = self.v.new_empty(shape)
+
+    def slide_window(self, keep_last_n: int | None = None, current: int | None = None) -> int:
+        """Drop the oldest KV entries and keep only the most recent suffix.
+
+        ``current`` may be supplied by the caller (e.g. from a CPU-side
+        decode_offset counter) to avoid the GPU→CPU sync of offset.item().
+        """
+        if current is None:
+            current = int(self.offset.item())
         capacity = self.k.shape[1]
         if current < capacity:
             return current
@@ -323,11 +344,20 @@ class Cache:
         if keep_last_n is None:
             keep_last_n = capacity - self.slide_chunk
         keep_last_n = max(1, min(keep_last_n, capacity - 1, current))
-        start = current - keep_last_n
-        retained_k = self.k[:, start:current].clone()
-        retained_v = self.v[:, start:current].clone()
-        self.k[:, :keep_last_n].copy_(retained_k)
-        self.v[:, :keep_last_n].copy_(retained_v)
+        self._ensure_slide_buffers()
+        start = current - keep_last_n  # first token to keep
+        chunk = self.slide_chunk
+        # Move the retained suffix in chunk-sized blocks via a reusable staging
+        # buffer, avoiding a per-slide clone() allocation on the hot path.
+        pos = 0
+        while pos < keep_last_n:
+            n = min(chunk, keep_last_n - pos)
+            src = start + pos
+            self._slide_k[:, :n].copy_(self.k[:, src:src + n])
+            self._slide_v[:, :n].copy_(self.v[:, src:src + n])
+            self.k[:, pos:pos + n].copy_(self._slide_k[:, :n])
+            self.v[:, pos:pos + n].copy_(self._slide_v[:, :n])
+            pos += n
         self.k[:, keep_last_n:, :, :].zero_()
         self.v[:, keep_last_n:, :, :].zero_()
         self.offset.fill_(keep_last_n)
@@ -861,7 +891,9 @@ class TokenGenerator:
 
         new_decode_offset = None
         for cache in self.caches:
-            kept = cache.slide_window()
+            # Pass decode_offset (CPU-tracked) as current to avoid offset.item() sync.
+            # decode_offset == cache.offset here because both are incremented in lockstep.
+            kept = cache.slide_window(current=decode_offset)
             if new_decode_offset is None:
                 new_decode_offset = kept
             else:
