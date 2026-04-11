@@ -9,6 +9,11 @@ import argparse
 
 from pathlib import Path
 
+try:
+    import gnureadline as readline
+except ImportError:
+    import readline
+
 import torch
 import termcolor
 
