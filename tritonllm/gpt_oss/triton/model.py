@@ -914,16 +914,19 @@ class TokenGenerator:
     @staticmethod
     def _has_repeating_token_pattern(
         recent_tokens: list[int],
-        window_size: int = 32,
         min_pattern_len: int = 2,
         max_pattern_len: int = 8,
+        min_repeats: int = 8,
     ) -> bool:
-        if len(recent_tokens) < window_size:
-            return False
-        window = recent_tokens[-window_size:]
-        for pattern_len in range(min_pattern_len, min(max_pattern_len, window_size) + 1):
-            pattern = window[:pattern_len]
-            if all(token == pattern[idx % pattern_len] for idx, token in enumerate(window)):
+        for pattern_len in range(min_pattern_len, max_pattern_len + 1):
+            required_tokens = pattern_len * min_repeats
+            if len(recent_tokens) < required_tokens:
+                continue
+            pattern = recent_tokens[-pattern_len:]
+            if all(
+                recent_tokens[-repeat_idx * pattern_len: -(repeat_idx - 1) * pattern_len or None] == pattern
+                for repeat_idx in range(1, min_repeats + 1)
+            ):
                 return True
         return False
 
@@ -1007,13 +1010,13 @@ class TokenGenerator:
 
             if enable_repeat_pattern_stop:
                 recent_generated_tokens.append(predicted_token)
-                if len(recent_generated_tokens) > 32:
+                if len(recent_generated_tokens) > 64:
                     recent_generated_tokens.pop(0)
                 if self._has_repeating_token_pattern(recent_generated_tokens):
                     loop_detected = True
                     print(
                         termcolor.colored(
-                            "Stopping generation after detecting a repeating 2-8 token pattern in the last 32 tokens",
+                            "Stopping generation after detecting 8 consecutive repeats of a 2-8 token pattern",
                             "yellow",
                         ),
                         flush=True,
