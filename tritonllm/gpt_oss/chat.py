@@ -232,7 +232,11 @@ def chat(args):
         output_text_delta_buffer = ""
         token_begin = time.perf_counter()
         token_num = 0
-        for predicted_token in generator.generate(tokens, encoding.stop_tokens_for_assistant_actions()):
+        for predicted_token in generator.generate(
+            tokens,
+            encoding.stop_tokens_for_assistant_actions(),
+            enable_repeat_pattern_stop=True,
+        ):
             token_num += 1
             parser.process(predicted_token)
             if args.raw:
