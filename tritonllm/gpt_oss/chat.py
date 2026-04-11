@@ -17,6 +17,7 @@ from gpt_oss.tools import apply_patch
 from gpt_oss.tools.simple_browser import SimpleBrowserTool
 from gpt_oss.tools.simple_browser.backend import ExaBackend
 from gpt_oss.tools.python_docker.docker_tool import PythonTool
+from gpt_oss.context_window import fit_messages_to_context
 from gpt_oss.tokenizer import get_tokenizer
 from tritonllm.utils import get_model_with_checkpoint
 
@@ -217,10 +218,27 @@ def chat(args):
                 else:
                     print(result[0].content[0].text)
 
-        conversation = Conversation.from_messages(messages)
-        tokens = encoding.render_conversation_for_completion(
-            conversation, Role.ASSISTANT
+        messages, tokens, dropped_messages, hard_truncated = fit_messages_to_context(
+            messages, encoding, generator.max_model_len
         )
+        if not args.raw and dropped_messages:
+            print(
+                termcolor.colored(
+                    f"Context exceeded {generator.max_model_len} tokens; "
+                    f"dropped {dropped_messages} old message(s) from history",
+                    "yellow",
+                ),
+                flush=True,
+            )
+        if not args.raw and hard_truncated:
+            print(
+                termcolor.colored(
+                    f"Latest prompt still exceeded {generator.max_model_len} tokens; "
+                    "left-truncated the tokenized prompt",
+                    "yellow",
+                ),
+                flush=True,
+            )
 
         if args.raw:
             # Print the last two tokens, which are the start of the assistant message
@@ -341,8 +359,8 @@ def get_parser_args():
         "--context",
         metavar="CONTEXT",
         type=int,
-        default=8192,
-        help="Max context length",
+        default=131072,
+        help="Max context length (default: 131072)",
     )
     parser.add_argument(
         "--raw",
