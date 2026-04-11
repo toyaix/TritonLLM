@@ -108,9 +108,9 @@ def rope_forward(query, key, sin, cos, max_context_length, offset):
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_V": 64, "BLOCK_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_V": 64, "BLOCK_K": 256}, num_warps=4, num_stages=4),
         triton.Config({"BLOCK_V": 128, "BLOCK_K": 128}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_V": 128, "BLOCK_K": 256}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_V": 256, "BLOCK_K": 128}, num_warps=8, num_stages=2),
     ],
     key=["hidden_size"],
 )
@@ -348,7 +348,9 @@ def qkv_decode_forward(hidden, weight, bias, q_dim, kv_dim):
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_K": 128}, num_warps=4, num_stages=4),
         triton.Config({"BLOCK_K": 256}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_K": 256}, num_warps=4, num_stages=4),
     ],
     key=["hidden_size", "num_q_heads", "num_kv_heads"],
 )
@@ -525,6 +527,229 @@ def qkv_rope_cache_decode_kernel(
     )
 
 
+@triton.jit
+def qkv_decode_splitk_kernel(
+    hidden_ptr,
+    weight_ptr,
+    partial_ptr,
+    hidden_size,
+    num_q_heads,
+    num_kv_heads,
+    stride_hidden_batch,
+    stride_hidden_dim,
+    stride_weight_out,
+    stride_weight_dim,
+    BS,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    pid_head = tl.program_id(0)
+    pid_batch = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_half = tl.arange(0, HEAD_DIM // 2)
+
+    total_heads = num_q_heads + 2 * num_kv_heads
+    q_dim = num_q_heads * HEAD_DIM
+    kv_dim = num_kv_heads * HEAD_DIM
+
+    is_q = pid_head < num_q_heads
+    is_k = (pid_head >= num_q_heads) & (pid_head < num_q_heads + num_kv_heads)
+
+    q_head = tl.where(is_q, pid_head, 0)
+    k_head = tl.where(is_k, pid_head - num_q_heads, 0)
+    v_head = tl.where(~is_q & ~is_k, pid_head - num_q_heads - num_kv_heads, 0)
+
+    out_base = tl.where(
+        is_q,
+        q_head * HEAD_DIM,
+        tl.where(
+            is_k,
+            q_dim + k_head * HEAD_DIM,
+            q_dim + kv_dim + v_head * HEAD_DIM,
+        ),
+    )
+    out_offsets_lo = out_base + offs_half
+    out_offsets_hi = out_base + HEAD_DIM // 2 + offs_half
+    out_mask_lo = out_offsets_lo < total_heads * HEAD_DIM
+    out_mask_hi = out_offsets_hi < total_heads * HEAD_DIM
+
+    # Compute K range for this split
+    n_k_blocks = tl.cdiv(hidden_size, BLOCK_K)
+    blocks_per_split = tl.cdiv(n_k_blocks, SPLIT_K)
+    k_lo = pid_k * blocks_per_split * BLOCK_K
+    k_hi = tl.minimum((pid_k + 1) * blocks_per_split * BLOCK_K, hidden_size)
+
+    hidden_ptr = hidden_ptr + pid_batch.to(tl.int64) * stride_hidden_batch
+    acc_lo = tl.zeros((HEAD_DIM // 2,), dtype=tl.float32)
+    acc_hi = tl.zeros((HEAD_DIM // 2,), dtype=tl.float32)
+
+    for k_start in range(k_lo, k_hi, BLOCK_K):
+        k_offsets = k_start + offs_k
+        hidden = tl.load(
+            hidden_ptr + k_offsets.to(tl.int64) * stride_hidden_dim,
+            mask=k_offsets < hidden_size,
+            other=0,
+        )
+        weight_lo = tl.load(
+            weight_ptr
+            + out_offsets_lo[:, None].to(tl.int64) * stride_weight_out
+            + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
+            mask=out_mask_lo[:, None] & (k_offsets[None, :] < hidden_size),
+            other=0,
+        )
+        weight_hi = tl.load(
+            weight_ptr
+            + out_offsets_hi[:, None].to(tl.int64) * stride_weight_out
+            + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
+            mask=out_mask_hi[:, None] & (k_offsets[None, :] < hidden_size),
+            other=0,
+        )
+        acc_lo += tl.sum(weight_lo * hidden[None, :], axis=1)
+        acc_hi += tl.sum(weight_hi * hidden[None, :], axis=1)
+
+    # Store partial: layout (SPLIT_K, BS, total_heads, HEAD_DIM)
+    base = (
+        pid_k.to(tl.int64) * BS * total_heads * HEAD_DIM
+        + pid_batch.to(tl.int64) * total_heads * HEAD_DIM
+        + pid_head.to(tl.int64) * HEAD_DIM
+    )
+    tl.store(partial_ptr + base + offs_half.to(tl.int64), acc_lo, mask=offs_half < HEAD_DIM // 2)
+    tl.store(partial_ptr + base + (HEAD_DIM // 2 + offs_half).to(tl.int64), acc_hi, mask=offs_half < HEAD_DIM // 2)
+
+
+@triton.jit
+def qkv_decode_reduce_kernel(
+    partial_ptr,
+    bias_ptr,
+    sin_ptr,
+    cos_ptr,
+    offset_ptr,
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    num_q_heads,
+    num_kv_heads,
+    stride_bias_out,
+    stride_sin_ctx,
+    stride_sin_dim,
+    stride_cos_ctx,
+    stride_cos_dim,
+    stride_q_batch,
+    stride_q_head,
+    stride_q_dim,
+    stride_k_batch,
+    stride_k_ctx,
+    stride_k_head,
+    stride_k_dim,
+    stride_v_batch,
+    stride_v_ctx,
+    stride_v_head,
+    stride_v_dim,
+    max_context_length,
+    BS,
+    HEAD_DIM: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    pid_head = tl.program_id(0)
+    pid_batch = tl.program_id(1)
+
+    offs_half = tl.arange(0, HEAD_DIM // 2)
+    total_heads = num_q_heads + 2 * num_kv_heads
+    q_dim = num_q_heads * HEAD_DIM
+    kv_dim = num_kv_heads * HEAD_DIM
+
+    is_q = pid_head < num_q_heads
+    is_k = (pid_head >= num_q_heads) & (pid_head < num_q_heads + num_kv_heads)
+    is_v = pid_head >= num_q_heads + num_kv_heads
+
+    q_head = tl.where(is_q, pid_head, 0)
+    k_head = tl.where(is_k, pid_head - num_q_heads, 0)
+    v_head = tl.where(is_v, pid_head - num_q_heads - num_kv_heads, 0)
+
+    out_base = tl.where(
+        is_q,
+        q_head * HEAD_DIM,
+        tl.where(
+            is_k,
+            q_dim + k_head * HEAD_DIM,
+            q_dim + kv_dim + v_head * HEAD_DIM,
+        ),
+    )
+    out_offsets_lo = out_base + offs_half
+    out_offsets_hi = out_base + HEAD_DIM // 2 + offs_half
+
+    # Sum SPLIT_K partials
+    acc_lo = tl.zeros((HEAD_DIM // 2,), dtype=tl.float32)
+    acc_hi = tl.zeros((HEAD_DIM // 2,), dtype=tl.float32)
+    for i in tl.static_range(SPLIT_K):
+        base = (
+            i * BS * total_heads * HEAD_DIM
+            + pid_batch.to(tl.int64) * total_heads * HEAD_DIM
+            + pid_head.to(tl.int64) * HEAD_DIM
+        )
+        acc_lo += tl.load(partial_ptr + base + offs_half.to(tl.int64))
+        acc_hi += tl.load(partial_ptr + base + (HEAD_DIM // 2 + offs_half).to(tl.int64))
+
+    # Add bias
+    out_mask_lo = out_offsets_lo < total_heads * HEAD_DIM
+    out_mask_hi = out_offsets_hi < total_heads * HEAD_DIM
+    bias_lo = tl.load(
+        bias_ptr + out_offsets_lo.to(tl.int64) * stride_bias_out,
+        mask=out_mask_lo,
+        other=0,
+    )
+    bias_hi = tl.load(
+        bias_ptr + out_offsets_hi.to(tl.int64) * stride_bias_out,
+        mask=out_mask_hi,
+        other=0,
+    )
+    acc_lo += bias_lo.to(tl.float32)
+    acc_hi += bias_hi.to(tl.float32)
+
+    # RoPE
+    raw_offset = tl.load(offset_ptr).to(tl.int64)
+    rope_offset = raw_offset % max_context_length
+    sin = tl.load(
+        sin_ptr + rope_offset * stride_sin_ctx + offs_half.to(tl.int64) * stride_sin_dim
+    ).to(tl.float32)
+    cos = tl.load(
+        cos_ptr + rope_offset * stride_cos_ctx + offs_half.to(tl.int64) * stride_cos_dim
+    ).to(tl.float32)
+    rot_lo = acc_lo * cos - acc_hi * sin
+    rot_hi = acc_hi * cos + acc_lo * sin
+
+    # Write Q
+    q_mask = is_q & (offs_half < HEAD_DIM // 2)
+    q_ptr = q_ptr + pid_batch.to(tl.int64) * stride_q_batch + q_head.to(tl.int64) * stride_q_head
+    tl.store(q_ptr + offs_half.to(tl.int64) * stride_q_dim, rot_lo.to(q_ptr.type.element_ty), mask=q_mask)
+    tl.store(q_ptr + (HEAD_DIM // 2 + offs_half).to(tl.int64) * stride_q_dim, rot_hi.to(q_ptr.type.element_ty), mask=q_mask)
+
+    # Write K cache
+    k_mask = is_k & (offs_half < HEAD_DIM // 2)
+    k_cache_ptr = (
+        k_cache_ptr
+        + pid_batch.to(tl.int64) * stride_k_batch
+        + raw_offset * stride_k_ctx
+        + k_head.to(tl.int64) * stride_k_head
+    )
+    tl.store(k_cache_ptr + offs_half.to(tl.int64) * stride_k_dim, rot_lo.to(k_cache_ptr.type.element_ty), mask=k_mask)
+    tl.store(k_cache_ptr + (HEAD_DIM // 2 + offs_half).to(tl.int64) * stride_k_dim, rot_hi.to(k_cache_ptr.type.element_ty), mask=k_mask)
+
+    # Write V cache (no rotation)
+    v_mask = is_v & (offs_half < HEAD_DIM // 2)
+    v_cache_ptr = (
+        v_cache_ptr
+        + pid_batch.to(tl.int64) * stride_v_batch
+        + raw_offset * stride_v_ctx
+        + v_head.to(tl.int64) * stride_v_head
+    )
+    tl.store(v_cache_ptr + offs_half.to(tl.int64) * stride_v_dim, acc_lo.to(v_cache_ptr.type.element_ty), mask=v_mask)
+    tl.store(v_cache_ptr + (HEAD_DIM // 2 + offs_half).to(tl.int64) * stride_v_dim, acc_hi.to(v_cache_ptr.type.element_ty), mask=v_mask)
+
+
 def qkv_rope_cache_decode_forward(
     hidden,
     weight,
@@ -566,52 +791,111 @@ def qkv_rope_cache_decode_forward(
 
     q = torch.empty((batch, num_q_heads, head_dim), device=hidden.device, dtype=hidden.dtype)
 
-    grid = (num_q_heads + 2 * num_kv_heads, batch)
-    qkv_rope_cache_decode_kernel[grid](
-        hidden,
-        weight,
-        bias,
-        sin,
-        cos,
-        offset,
-        q,
-        cache_k,
-        cache_v,
-        hidden_size,
-        num_q_heads,
-        num_kv_heads,
-        hidden.stride(0),
-        hidden.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        bias.stride(0),
-        sin.stride(0),
-        sin.stride(1),
-        cos.stride(0),
-        cos.stride(1),
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        cache_k.stride(0),
-        cache_k.stride(1),
-        cache_k.stride(2),
-        cache_k.stride(3),
-        cache_v.stride(0),
-        cache_v.stride(1),
-        cache_v.stride(2),
-        cache_v.stride(3),
-        max_context_length,
-        HEAD_DIM=head_dim,
-    )
+    total_heads = num_q_heads + 2 * num_kv_heads
+    SPLIT_K = 4 if hidden_size > 512 else 1
+    BLOCK_K = 128
+
+    if SPLIT_K == 1:
+        grid = (total_heads, batch)
+        qkv_rope_cache_decode_kernel[grid](
+            hidden,
+            weight,
+            bias,
+            sin,
+            cos,
+            offset,
+            q,
+            cache_k,
+            cache_v,
+            hidden_size,
+            num_q_heads,
+            num_kv_heads,
+            hidden.stride(0),
+            hidden.stride(1),
+            weight.stride(0),
+            weight.stride(1),
+            bias.stride(0),
+            sin.stride(0),
+            sin.stride(1),
+            cos.stride(0),
+            cos.stride(1),
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            cache_k.stride(0),
+            cache_k.stride(1),
+            cache_k.stride(2),
+            cache_k.stride(3),
+            cache_v.stride(0),
+            cache_v.stride(1),
+            cache_v.stride(2),
+            cache_v.stride(3),
+            max_context_length,
+            HEAD_DIM=head_dim,
+        )
+    else:
+        partial = torch.empty((SPLIT_K, batch, total_heads, head_dim), device=hidden.device, dtype=torch.float32)
+        qkv_decode_splitk_kernel[(total_heads, batch, SPLIT_K)](
+            hidden,
+            weight,
+            partial,
+            hidden_size,
+            num_q_heads,
+            num_kv_heads,
+            hidden.stride(0),
+            hidden.stride(1),
+            weight.stride(0),
+            weight.stride(1),
+            batch,
+            HEAD_DIM=head_dim,
+            BLOCK_K=BLOCK_K,
+            SPLIT_K=SPLIT_K,
+            num_warps=4,
+            num_stages=2,
+        )
+        qkv_decode_reduce_kernel[(total_heads, batch)](
+            partial,
+            bias,
+            sin,
+            cos,
+            offset,
+            q,
+            cache_k,
+            cache_v,
+            num_q_heads,
+            num_kv_heads,
+            bias.stride(0),
+            sin.stride(0),
+            sin.stride(1),
+            cos.stride(0),
+            cos.stride(1),
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            cache_k.stride(0),
+            cache_k.stride(1),
+            cache_k.stride(2),
+            cache_k.stride(3),
+            cache_v.stride(0),
+            cache_v.stride(1),
+            cache_v.stride(2),
+            cache_v.stride(3),
+            max_context_length,
+            batch,
+            HEAD_DIM=head_dim,
+            SPLIT_K=SPLIT_K,
+            num_warps=4,
+        )
     return q.reshape(batch, 1, num_q_heads * head_dim)
 
 
 @triton.autotune(
     configs=[
+        triton.Config({"BLOCK_OUT": 32, "BLOCK_K": 256}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_OUT": 64, "BLOCK_K": 256}, num_warps=8, num_stages=4),
         triton.Config({"BLOCK_OUT": 64, "BLOCK_K": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_OUT": 128, "BLOCK_K": 128}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_OUT": 128, "BLOCK_K": 256}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_OUT": 256, "BLOCK_K": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_OUT": 128, "BLOCK_K": 128}, num_warps=4, num_stages=2),
     ],
     key=["hidden_size", "out_dim"],
 )
@@ -679,6 +963,115 @@ def out_residual_decode_kernel(
 
     tl.store(
         out_ptr + offs_out.to(tl.int64) * stride_out_dim,
+        acc.to(out_ptr.type.element_ty),
+        mask=out_mask,
+    )
+
+
+@triton.jit
+def out_residual_decode_splitk_kernel(
+    hidden_ptr,
+    weight_ptr,
+    partial_ptr,
+    hidden_size,
+    out_dim,
+    stride_hidden_batch,
+    stride_hidden_dim,
+    stride_weight_out,
+    stride_weight_dim,
+    BS,
+    BLOCK_OUT: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    pid_out = tl.program_id(0)
+    pid_batch = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    offs_out = pid_out * BLOCK_OUT + tl.arange(0, BLOCK_OUT)
+    offs_k = tl.arange(0, BLOCK_K)
+    out_mask = offs_out < hidden_size
+
+    # Compute K range for this split
+    n_k_blocks = tl.cdiv(out_dim, BLOCK_K)
+    blocks_per_split = tl.cdiv(n_k_blocks, SPLIT_K)
+    k_lo = pid_k * blocks_per_split * BLOCK_K
+    k_hi = tl.minimum((pid_k + 1) * blocks_per_split * BLOCK_K, out_dim)
+
+    hidden_ptr = hidden_ptr + pid_batch.to(tl.int64) * stride_hidden_batch
+    acc = tl.zeros((BLOCK_OUT,), dtype=tl.float32)
+
+    for k_start in range(k_lo, k_hi, BLOCK_K):
+        k_offsets = k_start + offs_k
+        hidden = tl.load(
+            hidden_ptr + k_offsets.to(tl.int64) * stride_hidden_dim,
+            mask=k_offsets < out_dim,
+            other=0,
+        )
+        weight = tl.load(
+            weight_ptr
+            + offs_out[:, None].to(tl.int64) * stride_weight_out
+            + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
+            mask=out_mask[:, None] & (k_offsets[None, :] < out_dim),
+            other=0,
+        )
+        acc += tl.sum(weight * hidden[None, :], axis=1)
+
+    # Store partial: layout (SPLIT_K, BS, hidden_size)
+    partial_offset = (
+        pid_k.to(tl.int64) * BS * hidden_size
+        + pid_batch.to(tl.int64) * hidden_size
+        + offs_out.to(tl.int64)
+    )
+    tl.store(partial_ptr + partial_offset, acc, mask=out_mask)
+
+
+@triton.jit
+def out_residual_decode_reduce_kernel(
+    partial_ptr,
+    bias_ptr,
+    residual_ptr,
+    out_ptr,
+    hidden_size,
+    stride_bias_dim,
+    stride_residual_batch,
+    stride_residual_dim,
+    stride_out_batch,
+    stride_out_dim,
+    BS,
+    BLOCK_OUT: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    pid_out = tl.program_id(0)
+    pid_batch = tl.program_id(1)
+
+    offs_out = pid_out * BLOCK_OUT + tl.arange(0, BLOCK_OUT)
+    out_mask = offs_out < hidden_size
+
+    acc = tl.zeros((BLOCK_OUT,), dtype=tl.float32)
+    for i in tl.static_range(SPLIT_K):
+        partial_offset = (
+            i * BS * hidden_size
+            + pid_batch.to(tl.int64) * hidden_size
+            + offs_out.to(tl.int64)
+        )
+        partial = tl.load(partial_ptr + partial_offset, mask=out_mask, other=0)
+        acc += partial
+
+    bias = tl.load(
+        bias_ptr + offs_out.to(tl.int64) * stride_bias_dim,
+        mask=out_mask,
+        other=0,
+    )
+    residual = tl.load(
+        residual_ptr + pid_batch.to(tl.int64) * stride_residual_batch + offs_out.to(tl.int64) * stride_residual_dim,
+        mask=out_mask,
+        other=0,
+    )
+    acc += bias.to(tl.float32) + residual.to(tl.float32)
+
+    tl.store(
+        out_ptr + pid_batch.to(tl.int64) * stride_out_batch + offs_out.to(tl.int64) * stride_out_dim,
         acc.to(out_ptr.type.element_ty),
         mask=out_mask,
     )
