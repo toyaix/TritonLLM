@@ -155,6 +155,8 @@ class OUT(torch.nn.Module):
 
 
 class RotaryEmbedding(torch.nn.Module):
+    _cos_sin_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
     def __init__(
         self,
         head_dim: int,
@@ -177,7 +179,29 @@ class RotaryEmbedding(torch.nn.Module):
         self.ntk_alpha = ntk_alpha
         self.ntk_beta = ntk_beta
         self.device = device
-        self.cos, self.sin = self._compute_cos_sin(0, self.max_context_length)
+        self.cos, self.sin = self._get_or_create_cos_sin()
+
+    def _cache_key(self) -> tuple:
+        return (
+            self.device.type if self.device is not None else None,
+            self.device.index if self.device is not None else None,
+            self.head_dim,
+            self.base,
+            self.dtype,
+            self.initial_context_length,
+            self.max_context_length,
+            self.scaling_factor,
+            self.ntk_alpha,
+            self.ntk_beta,
+        )
+
+    def _get_or_create_cos_sin(self) -> tuple[torch.Tensor, torch.Tensor]:
+        key = self._cache_key()
+        cached = self._cos_sin_cache.get(key)
+        if cached is None:
+            cached = self._compute_cos_sin(0, self.max_context_length)
+            self._cos_sin_cache[key] = cached
+        return cached
 
     def _compute_concentration_and_inv_freq(self) -> torch.Tensor:
         """See YaRN paper: https://arxiv.org/abs/2309.00071"""
@@ -699,18 +723,21 @@ class Transformer(torch.nn.Module):
         self.norm = RMSNorm(config.hidden_size, device=device)
         self.unembedding = UnEmbedding(config.hidden_size, config.vocab_size, device=device)
 
-
-    def forward(self, x: torch.Tensor, caches: list[Cache] | None = None) -> torch.Tensor:
-        caches=caches or [None] * len(self.block)
+    def _forward_hidden(self, x: torch.Tensor, caches: list[Cache] | None = None) -> torch.Tensor:
+        caches = caches or [None] * len(self.block)
         x = self.embedding(x)
         for block, cache in zip(self.block, caches):
             x = block(x, cache=cache)
-        x = self.norm(x)
+        return self.norm(x)
+
+    def forward(self, x: torch.Tensor, caches: list[Cache] | None = None) -> torch.Tensor:
+        x = self._forward_hidden(x, caches)
         x = self.unembedding(x)
         return x.float()
 
     def prefill(self, x: torch.Tensor, caches):
-        self.forward(x, caches)
+        """Populate KV cache for the prompt without paying vocab projection cost."""
+        return self._forward_hidden(x, caches)
 
     @staticmethod
     def from_checkpoint(
@@ -785,6 +812,7 @@ class TokenGenerator:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
+        self._sampling_probs = torch.empty_like(self.logits[0])
         if self.enable_dense_cache_sliding:
             print(
                 termcolor.colored(
@@ -804,10 +832,13 @@ class TokenGenerator:
     @torch.inference_mode()
     def sample_next_token(self, logits: torch.Tensor, temperature: float) -> int:
         """Executed only on rank 0."""
+        logits = logits[-1]
         if temperature == 0.0:
-            return torch.argmax(logits[-1, :], dim=-1).item()
-        probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
-        return torch.multinomial(probs[-1, :], num_samples=1).item()
+            return logits.argmax().item()
+        self._sampling_probs.copy_(logits)
+        self._sampling_probs.div_(temperature)
+        torch.softmax(self._sampling_probs, dim=-1, out=self._sampling_probs)
+        return torch.multinomial(self._sampling_probs, num_samples=1).item()
 
     def _handle_kv_capacity(self, decode_offset: int) -> tuple[bool, int]:
         if decode_offset < self.max_model_len:
@@ -857,9 +888,10 @@ class TokenGenerator:
                 "Truncate the conversation history before calling generate()."
             )
         prompt_tokens = torch.as_tensor(prompt_tokens, dtype=torch.int32, device=self.device)
-        self.model(prompt_tokens[None, :-1], self.caches)
         predicted_token = prompt_tokens[-1]
         decode_offset = prompt_tokens.numel() - 1
+        if decode_offset > 0:
+            self.model.prefill(prompt_tokens[None, :-1], self.caches)
         num_generated_tokens = 0
         if os.getenv("profile", "0") == "1":
             print("DEBUG: You are currently in profiling mode. To disable, run `export profile=0`", flush=True)
