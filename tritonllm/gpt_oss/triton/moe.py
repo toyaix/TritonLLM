@@ -5,7 +5,6 @@ from triton_kernels.swiglu import swiglu_fn
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
 from triton_kernels.matmul_ogs import PrecisionConfig, FlexCtx, FnSpecs, FusedActivation
 from triton_kernels.matmul_ogs import matmul_ogs
-from triton_kernels.matmul_ogs_details.opt_flags import update_opt_flags_constraints, reset_opt_flags_constraints
 from triton_kernels.numerics import InFlexData
 from triton_kernels.routing import routing, RoutingData, ExptData, GatherIndx, ScatterIndx
 from triton_kernels.tensor import convert_layout
@@ -165,16 +164,9 @@ def moe_decode(
             logits = logits + bg
     with record_function("routing_decode"):
         expt_indx = torch.topk(logits, experts_per_token, dim=1, sorted=False).indices.to(torch.int32)
-        # Fast path for single-token decode: pure PyTorch ops, no Triton routing kernels.
-        # Falls back to standard routing for batch decode (n_ctx > 1).
-        if x.shape[0] == 1:
-            rdata, gather_indx, scatter_indx = routing_decode_fast(
-                logits, expt_indx, num_experts, experts_per_token
-            )
-        else:
-            rdata, gather_indx, scatter_indx = routing(
-                logits, experts_per_token, expt_indx=expt_indx, simulated_ep=1,
-            )
+        rdata, gather_indx, scatter_indx = routing(
+            logits, experts_per_token, expt_indx=expt_indx, simulated_ep=1,
+        )
 
     if fused_act:
         assert interleaved, "Fused activation requires interleaved weights"
@@ -188,12 +180,6 @@ def moe_decode(
             x = swiglu(x, limit=swiglu_limit, interleaved=interleaved)
 
     with record_function("w2_decode"):
-        # W2 decode: use split_k=1 to enable fused_scatter, eliminating the
-        # finalize kernel's f32 scratchpad and reducing finalize bandwidth ~2.5×.
-        # With 4 active experts × 23 N-blocks = 92 grid tiles, split_k=1 is
-        # sufficient to fill most SMs (170) without needing extra K-parallelism.
-        update_opt_flags_constraints({"split_k": 1})
         x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2, gammas=rdata.gate_scal)
-        reset_opt_flags_constraints()
     return x
 
