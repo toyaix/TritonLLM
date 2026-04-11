@@ -861,9 +861,9 @@ class TokenGenerator:
         for cache in self.caches:
             kept = cache.slide_window()
             if new_decode_offset is None:
-                new_decode_offset = kept - 1
+                new_decode_offset = kept
             else:
-                assert new_decode_offset == kept - 1
+                assert new_decode_offset == kept
         if not self._dense_slide_warned:
             self._dense_slide_warned = True
             print(
