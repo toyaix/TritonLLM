@@ -846,6 +846,7 @@ class TokenGenerator:
         with torch.cuda.graph(self.graph):
             self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
         self._sampling_probs = torch.empty_like(self.logits[0])
+        self._sampled_tokens = torch.empty(1, dtype=torch.int32, device=self.device)
         self.last_generation_stats = None
         if self.enable_dense_cache_sliding:
             print(
@@ -866,15 +867,24 @@ class TokenGenerator:
     @torch.inference_mode()
     def sample_next_token(self, logits: torch.Tensor, temperature: float) -> int:
         """Executed only on rank 0."""
+        return self._sample_next_token_device(logits, temperature).item()
+
+    def _sample_next_token_device(self, logits: torch.Tensor, temperature: float) -> torch.Tensor:
+        """Sample the next token and keep the result on device."""
         logits = logits[-1]
         if temperature == 0.0:
-            return logits.argmax().item()
+            return logits.argmax()
         # Gumbel-max trick: argmax(logits + T*Gumbel(0,1)) is distributed as
         # categorical(softmax(logits/T)).  Avoids softmax's exp+normalize and
         # multinomial's serial cumsum; argmax is a fast parallel tree-reduction.
         # _sampling_probs is pre-allocated (vocab,) float32 on GPU.
         self._sampling_probs.exponential_().log_().neg_().mul_(temperature).add_(logits)
-        return self._sampling_probs.argmax().item()
+        return self._sampling_probs.argmax()
+
+    def _ensure_decode_buffers(self, decode_chunk_size: int) -> None:
+        if self._sampled_tokens.numel() >= decode_chunk_size:
+            return
+        self._sampled_tokens = torch.empty(decode_chunk_size, dtype=torch.int32, device=self.device)
 
     def _handle_kv_capacity(self, decode_offset: int) -> tuple[bool, int]:
         if decode_offset < self.max_model_len:
@@ -915,8 +925,10 @@ class TokenGenerator:
                  stop_tokens: list[int] | None = None,
                  temperature: float = 1.0,
                  max_tokens: int = 0,
-                 return_logprobs: bool = False):
+                 return_logprobs: bool = False,
+                 decode_chunk_size: int = 1):
         stop_tokens = stop_tokens or []
+        stop_tokens_set = set(stop_tokens)
         self.last_generation_stats = None
         for cache in self.caches:
             cache.reset()
@@ -927,7 +939,7 @@ class TokenGenerator:
                 "Truncate the conversation history before calling generate()."
             )
         prompt_tokens = torch.as_tensor(prompt_tokens, dtype=torch.int32, device=self.device)
-        predicted_token = prompt_tokens[-1]
+        self.input_token.copy_(prompt_tokens[-1:])
         decode_offset = prompt_tokens.numel() - 1
         prefill_elapsed = 0.0
         if decode_offset > 0:
@@ -952,7 +964,6 @@ class TokenGenerator:
                     can_continue, decode_offset = self._handle_kv_capacity(decode_offset)
                     if not can_continue:
                         return
-                    self.input_token[0] = predicted_token
                     self.graph.replay()
                     self.sample_next_token(self.logits, temperature)
             self.last_generation_stats = {
@@ -965,25 +976,55 @@ class TokenGenerator:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         decode_start = time.perf_counter()
-        while max_tokens == 0 or num_generated_tokens < max_tokens:
-            can_continue, decode_offset = self._handle_kv_capacity(decode_offset)
-            if not can_continue:
-                break
-            self.input_token[0] = predicted_token
-            self.graph.replay()
-            predicted_token = self.sample_next_token(self.logits, temperature)
-            decode_offset += 1
-            num_generated_tokens += 1
+        use_chunked_decode = self.device.type == "cuda" and not return_logprobs and decode_chunk_size > 1
+        if use_chunked_decode:
+            self._ensure_decode_buffers(decode_chunk_size)
+            should_stop = False
+            while not should_stop and (max_tokens == 0 or num_generated_tokens < max_tokens):
+                chunk_generated = 0
+                chunk_limit = decode_chunk_size
+                if max_tokens > 0:
+                    chunk_limit = min(chunk_limit, max_tokens - num_generated_tokens)
+                while chunk_generated < chunk_limit:
+                    can_continue, decode_offset = self._handle_kv_capacity(decode_offset)
+                    if not can_continue:
+                        should_stop = True
+                        break
+                    self.graph.replay()
+                    next_token = self._sample_next_token_device(self.logits, temperature)
+                    self._sampled_tokens[chunk_generated].copy_(next_token)
+                    self.input_token[0].copy_(next_token)
+                    decode_offset += 1
+                    chunk_generated += 1
+                if chunk_generated == 0:
+                    break
+                chunk_tokens = self._sampled_tokens[:chunk_generated].cpu().tolist()
+                for predicted_token in chunk_tokens:
+                    num_generated_tokens += 1
+                    yield predicted_token
+                    if predicted_token in stop_tokens_set:
+                        should_stop = True
+                        break
+        else:
+            while max_tokens == 0 or num_generated_tokens < max_tokens:
+                can_continue, decode_offset = self._handle_kv_capacity(decode_offset)
+                if not can_continue:
+                    break
+                self.graph.replay()
+                predicted_token = self.sample_next_token(self.logits, temperature)
+                self.input_token[0] = predicted_token
+                decode_offset += 1
+                num_generated_tokens += 1
 
-            if return_logprobs:
-                logprobs = torch.log_softmax(self.logits[-1, :], dim=-1)
-                selected_logprobs = logprobs[predicted_token].item()
-                yield predicted_token, selected_logprobs
-            else:
-                yield predicted_token
+                if return_logprobs:
+                    logprobs = torch.log_softmax(self.logits[-1, :], dim=-1)
+                    selected_logprobs = logprobs[predicted_token].item()
+                    yield predicted_token, selected_logprobs
+                else:
+                    yield predicted_token
 
-            if predicted_token in stop_tokens:
-                break
+                if predicted_token in stop_tokens_set:
+                    break
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         decode_elapsed = time.perf_counter() - decode_start

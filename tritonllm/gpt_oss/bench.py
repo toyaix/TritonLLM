@@ -54,6 +54,8 @@ REASONING_EFFORT = {
     "low": ReasoningEffort.LOW,
 }
 
+BENCH_DECODE_CHUNK_SIZE = 32
+
 
 class HarmonyChatTool:
     """Unified Harmony Chat Tool supporting multiple modes"""
@@ -318,7 +320,10 @@ class HarmonyChatTool:
 
         token_num = 0
         for predicted_token in self.generator.generate(
-            tokens, self.encoding.stop_tokens_for_assistant_actions(), max_tokens=max_tokens
+            tokens,
+            self.encoding.stop_tokens_for_assistant_actions(),
+            max_tokens=max_tokens,
+            decode_chunk_size=BENCH_DECODE_CHUNK_SIZE,
         ):
             token_num += 1
 
