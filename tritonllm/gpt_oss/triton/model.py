@@ -909,6 +909,22 @@ class TokenGenerator:
             )
         return True, new_decode_offset
 
+    @staticmethod
+    def _has_repeating_token_pattern(
+        recent_tokens: list[int],
+        window_size: int = 32,
+        min_pattern_len: int = 2,
+        max_pattern_len: int = 8,
+    ) -> bool:
+        if len(recent_tokens) < window_size:
+            return False
+        window = recent_tokens[-window_size:]
+        for pattern_len in range(min_pattern_len, min(max_pattern_len, window_size) + 1):
+            pattern = window[:pattern_len]
+            if all(token == pattern[idx % pattern_len] for idx, token in enumerate(window)):
+                return True
+        return False
+
     @torch.inference_mode()
     def generate(self,
                  prompt_tokens: list[int],
@@ -939,6 +955,8 @@ class TokenGenerator:
                 torch.cuda.synchronize(self.device)
             prefill_elapsed = time.perf_counter() - prefill_start
         num_generated_tokens = 0
+        recent_generated_tokens: list[int] = []
+        loop_detected = False
         if os.getenv("profile", "0") == "1":
             print("DEBUG: You are currently in profiling mode. To disable, run `export profile=0`", flush=True)
             with profile(
@@ -982,6 +1000,19 @@ class TokenGenerator:
             else:
                 yield predicted_token
 
+            recent_generated_tokens.append(predicted_token)
+            if len(recent_generated_tokens) > 32:
+                recent_generated_tokens.pop(0)
+            if self._has_repeating_token_pattern(recent_generated_tokens):
+                loop_detected = True
+                print(
+                    termcolor.colored(
+                        "Stopping generation after detecting a repeating 2-8 token pattern in the last 32 tokens",
+                        "yellow",
+                    ),
+                    flush=True,
+                )
+                break
             if predicted_token in stop_tokens:
                 break
         if self.device.type == "cuda":
@@ -991,4 +1022,5 @@ class TokenGenerator:
             "generated_tokens": num_generated_tokens,
             "prefill_time_s": prefill_elapsed,
             "decode_time_s": decode_elapsed,
+            "loop_detected": loop_detected,
         }
