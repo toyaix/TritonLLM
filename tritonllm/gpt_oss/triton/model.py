@@ -2,6 +2,7 @@ import json
 import math
 import os
 import termcolor
+import time
 from dataclasses import dataclass
 
 import torch
@@ -813,6 +814,7 @@ class TokenGenerator:
         with torch.cuda.graph(self.graph):
             self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
         self._sampling_probs = torch.empty_like(self.logits[0])
+        self.last_generation_stats = None
         if self.enable_dense_cache_sliding:
             print(
                 termcolor.colored(
@@ -879,6 +881,7 @@ class TokenGenerator:
                  max_tokens: int = 0,
                  return_logprobs: bool = False):
         stop_tokens = stop_tokens or []
+        self.last_generation_stats = None
         for cache in self.caches:
             cache.reset()
         if len(prompt_tokens) > self.max_model_len:
@@ -890,8 +893,15 @@ class TokenGenerator:
         prompt_tokens = torch.as_tensor(prompt_tokens, dtype=torch.int32, device=self.device)
         predicted_token = prompt_tokens[-1]
         decode_offset = prompt_tokens.numel() - 1
+        prefill_elapsed = 0.0
         if decode_offset > 0:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            prefill_start = time.perf_counter()
             self.model.prefill(prompt_tokens[None, :-1], self.caches)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            prefill_elapsed = time.perf_counter() - prefill_start
         num_generated_tokens = 0
         if os.getenv("profile", "0") == "1":
             print("DEBUG: You are currently in profiling mode. To disable, run `export profile=0`", flush=True)
@@ -909,8 +919,16 @@ class TokenGenerator:
                     self.input_token[0] = predicted_token
                     self.graph.replay()
                     self.sample_next_token(self.logits, temperature)
+            self.last_generation_stats = {
+                "generated_tokens": 0,
+                "prefill_time_s": prefill_elapsed,
+                "decode_time_s": 0.0,
+            }
             return
 
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        decode_start = time.perf_counter()
         while max_tokens == 0 or num_generated_tokens < max_tokens:
             can_continue, decode_offset = self._handle_kv_capacity(decode_offset)
             if not can_continue:
@@ -930,3 +948,11 @@ class TokenGenerator:
 
             if predicted_token in stop_tokens:
                 break
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        decode_elapsed = time.perf_counter() - decode_start
+        self.last_generation_stats = {
+            "generated_tokens": num_generated_tokens,
+            "prefill_time_s": prefill_elapsed,
+            "decode_time_s": decode_elapsed,
+        }

@@ -308,8 +308,8 @@ class HarmonyChatTool:
 
         return current_output_text
 
-    def _benchmark_inference(self, user_message: str, messages: List[Message], max_tokens: int = 0) -> int:
-        """Perform benchmark inference returning token count"""
+    def _benchmark_inference(self, user_message: str, messages: List[Message], max_tokens: int = 0) -> dict:
+        """Perform benchmark inference returning generation stats."""
         user_msg = Message.from_role_and_content(Role.USER, user_message)
         messages.append(user_msg)
 
@@ -322,7 +322,12 @@ class HarmonyChatTool:
         ):
             token_num += 1
 
-        return max(0, token_num - 10)
+        generation_stats = self.generator.last_generation_stats or {}
+        return {
+            "generated_tokens": token_num,
+            "prefill_time_s": generation_stats.get("prefill_time_s", 0.0),
+            "decode_time_s": generation_stats.get("decode_time_s", 0.0),
+        }
 
     def _process_tool_call(self, message: Message) -> List[Message]:
         """Process tool calls and return result messages"""
@@ -579,7 +584,13 @@ class HarmonyChatTool:
                 )
 
         # Run benchmarks
-        overall_stats = {"total_time": 0, "total_tokens": 0}
+        overall_stats = {
+            "total_time": 0.0,
+            "total_tokens": 0,
+            "prefill_time": 0.0,
+            "decode_time": 0.0,
+            "num_prompts": 0,
+        }
 
         for prompt_file in prompt_files:
             lines = self.get_file_lines(prompt_file, shuffle=False)
@@ -587,33 +598,68 @@ class HarmonyChatTool:
                 continue
 
             print(termcolor.colored(f"\nBenchmarking {prompt_file}...", "cyan"))
-            time_sum, token_sum = 0, 0
+            time_sum, token_sum = 0.0, 0
+            prefill_time_sum, decode_time_sum = 0.0, 0.0
 
             for i, user_message in enumerate(lines):
                 print(f"Processing prompt {i+1}/{len(lines)}: {user_message[:50]}...")
 
                 token_begin = time.perf_counter()
                 messages = self.base_messages.copy()
-                token_num = self._benchmark_inference(user_message, messages)
+                stats = self._benchmark_inference(user_message, messages)
                 elapsed = time.perf_counter() - token_begin
+                token_num = stats["generated_tokens"]
+                prefill_time = stats["prefill_time_s"]
+                decode_time = stats["decode_time_s"]
 
                 time_sum += elapsed
                 token_sum += token_num
+                prefill_time_sum += prefill_time
+                decode_time_sum += decode_time
 
-                if elapsed > 0:
-                    tps = token_num / elapsed
-                    print(termcolor.colored(f'TPS: {tps:.3f}', "yellow"))
+                decode_tps = token_num / decode_time if decode_time > 0 else 0.0
+                e2e_tps = token_num / elapsed if elapsed > 0 else 0.0
+                print(
+                    termcolor.colored(
+                        "Generated: "
+                        f"{token_num} | "
+                        f"Prefill: {prefill_time * 1000:.3f} ms | "
+                        f"Decode: {decode_time * 1000:.3f} ms | "
+                        f"Decode TPS: {decode_tps:.3f} | "
+                        f"E2E TPS: {e2e_tps:.3f}",
+                        "yellow",
+                    )
+                )
 
             if time_sum > 0:
-                avg_tps = token_sum / time_sum
-                print(termcolor.colored(f'{prompt_file} AVG TPS: {avg_tps:.3f}', "green"))
+                avg_prefill_ms = (prefill_time_sum / len(lines)) * 1000.0
+                avg_decode_tps = token_sum / decode_time_sum if decode_time_sum > 0 else 0.0
+                avg_e2e_tps = token_sum / time_sum
+                print(termcolor.colored(f'{prompt_file} AVG Prefill: {avg_prefill_ms:.3f} ms', "green"))
+                print(termcolor.colored(f'{prompt_file} AVG Decode TPS: {avg_decode_tps:.3f}', "green"))
+                print(termcolor.colored(f'{prompt_file} AVG E2E TPS: {avg_e2e_tps:.3f}', "green"))
                 overall_stats["total_time"] += time_sum
                 overall_stats["total_tokens"] += token_sum
+                overall_stats["prefill_time"] += prefill_time_sum
+                overall_stats["decode_time"] += decode_time_sum
+                overall_stats["num_prompts"] += len(lines)
 
         # Overall statistics
         if overall_stats["total_time"] > 0:
-            overall_tps = overall_stats["total_tokens"] / overall_stats["total_time"]
-            print(termcolor.colored(f'\nOverall AVG TPS: {overall_tps:.3f}', "magenta"))
+            overall_avg_prefill_ms = (
+                overall_stats["prefill_time"] / overall_stats["num_prompts"] * 1000.0
+                if overall_stats["num_prompts"] > 0
+                else 0.0
+            )
+            overall_decode_tps = (
+                overall_stats["total_tokens"] / overall_stats["decode_time"]
+                if overall_stats["decode_time"] > 0
+                else 0.0
+            )
+            overall_e2e_tps = overall_stats["total_tokens"] / overall_stats["total_time"]
+            print(termcolor.colored(f'\nOverall AVG Prefill: {overall_avg_prefill_ms:.3f} ms', "magenta"))
+            print(termcolor.colored(f'Overall AVG Decode TPS: {overall_decode_tps:.3f}', "magenta"))
+            print(termcolor.colored(f'Overall AVG E2E TPS: {overall_e2e_tps:.3f}', "magenta"))
 
     def single_inference(self, user_message: str, interactive: bool = True) -> str:
         """Perform single inference - API interface"""
