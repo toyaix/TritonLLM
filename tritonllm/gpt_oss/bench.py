@@ -621,12 +621,11 @@ class HarmonyChatTool:
                 e2e_tps = token_num / elapsed if elapsed > 0 else 0.0
                 print(
                     termcolor.colored(
-                        "Generated: "
-                        f"{token_num} | "
-                        f"Prefill: {prefill_time * 1000:.3f} ms | "
-                        f"Decode: {decode_time * 1000:.3f} ms | "
-                        f"Decode TPS: {decode_tps:.3f} | "
-                        f"E2E TPS: {e2e_tps:.3f}",
+                        f"  Generated tokens: {token_num}\n"
+                        f"  Prefill:          {prefill_time * 1000:.3f} ms\n"
+                        f"  Decode:           {decode_time * 1000:.3f} ms\n"
+                        f"  Decode TPS:       {decode_tps:.3f}\n"
+                        f"  E2E TPS:          {e2e_tps:.3f}",
                         "yellow",
                     )
                 )

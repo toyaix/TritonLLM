@@ -324,8 +324,10 @@ class Cache:
             keep_last_n = capacity - self.slide_chunk
         keep_last_n = max(1, min(keep_last_n, capacity - 1, current))
         start = current - keep_last_n
-        self.k[:, :keep_last_n].copy_(self.k[:, start:current])
-        self.v[:, :keep_last_n].copy_(self.v[:, start:current])
+        retained_k = self.k[:, start:current].clone()
+        retained_v = self.v[:, start:current].clone()
+        self.k[:, :keep_last_n].copy_(retained_k)
+        self.v[:, :keep_last_n].copy_(retained_v)
         self.k[:, keep_last_n:, :, :].zero_()
         self.v[:, keep_last_n:, :, :].zero_()
         self.offset.fill_(keep_last_n)
