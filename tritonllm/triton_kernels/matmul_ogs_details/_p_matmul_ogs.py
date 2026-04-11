@@ -21,6 +21,10 @@ def cuda_capability_geq(major, minor):
     return target_info.cuda_capability_geq(major, minor)
 
 @constexpr_function
+def has_tma_scatter():
+    return target_info.has_tma_scatter()
+
+@constexpr_function
 def get_dtype(tensor_or_desc: tl.tensor | tl.tensor_descriptor) -> tl.dtype:
     if isinstance(tensor_or_desc, tl.tensor):
         return tensor_or_desc.dtype.element_ty
@@ -218,9 +222,9 @@ def _p_matmul_ogs(
 
     USE_FLEXPOINT_SCALE: tl.constexpr = YActualScale is not None or YChecksumScale is not None
 
-    USE_GATHER_TMA: tl.constexpr = GatherIndx is not None and cuda_capability_geq(10, 0)
+    USE_GATHER_TMA: tl.constexpr = GatherIndx is not None and isinstance(X, tl.tensor_descriptor) and cuda_capability_geq(10, 0)
     X_USE_LOAD_TMA: tl.constexpr = GatherIndx is None and isinstance(X, tl.tensor_descriptor)
-    USE_SCATTER_TMA: tl.constexpr = (cuda_capability_geq(10, 0) and HAS_FUSED_SCATTER) and not DISABLE_Y_TMA
+    USE_SCATTER_TMA: tl.constexpr = (has_tma_scatter() and HAS_FUSED_SCATTER) and not DISABLE_Y_TMA
     INT_MAX: tl.constexpr = 2147483647
 
     if USE_SCATTER_TMA:
@@ -395,7 +399,7 @@ def _p_matmul_ogs(
         if B is not None:
             BPtrs = B + expt_id1 * stride_b_e + offs_y_n
             if pid_k1 == 0:
-                bias = tl.load(BPtrs, mask=mask_n, other=0)
+                bias = tl.load(BPtrs, mask=mask_n, other=0).to(tl.float32)
             else:
                 bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
         else:
