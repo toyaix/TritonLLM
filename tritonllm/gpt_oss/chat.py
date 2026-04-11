@@ -248,6 +248,9 @@ def chat(args):
         field_created = False
         current_output_text = ""
         output_text_delta_buffer = ""
+        inline_status_pending = not args.raw
+        if inline_status_pending:
+            print(termcolor.colored("Generating...", "yellow"), end="\r", flush=True)
         token_begin = time.perf_counter()
         token_num = 0
         for predicted_token in generator.generate(
@@ -269,6 +272,9 @@ def chat(args):
                 continue
 
             if not field_created:
+                if inline_status_pending:
+                    print("\r\033[K", end="", flush=True)
+                    inline_status_pending = False
                 field_created = True
                 if parser.current_channel == "final":
                     print(termcolor.colored("Assistant:", "green"), flush=True)
@@ -288,12 +294,22 @@ def chat(args):
                 print(output_text_delta_buffer, end="", flush=True)
                 current_output_text += output_text_delta_buffer
                 output_text_delta_buffer = ""
-        # token_num = len(tokenizer.encode(current_output_text))
-        # has 10 parser.last_content_delta
-        token_num -=  10
+        if inline_status_pending:
+            print("\r\033[K", end="", flush=True)
         token_end = time.perf_counter()
         elapsed = token_end - token_begin
-        print(termcolor.colored(f'TPS(Tokens Per Second) {token_num / elapsed:.3f}', "yellow"), flush=True)
+        generation_stats = generator.last_generation_stats or {}
+        generated_tokens = generation_stats.get("generated_tokens", token_num)
+        decode_time = generation_stats.get("decode_time_s", 0.0)
+        decode_tps = generated_tokens / decode_time if decode_time > 0 else 0.0
+        e2e_tps = generated_tokens / elapsed if elapsed > 0 else 0.0
+        print(
+            termcolor.colored(
+                f"Decode TPS: {decode_tps:.3f} | E2E TPS: {e2e_tps:.3f} | Generated: {generated_tokens}",
+                "yellow",
+            ),
+            flush=True,
+        )
         messages += parser.messages
 
 def get_parser_args():
