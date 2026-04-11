@@ -626,8 +626,8 @@ class HarmonyChatTool:
                 row2_col2 = f"{'Prefill:':<10}{prefill_time * 1000:>8.1f} ms"
                 print(
                     termcolor.colored(
-                        "  {c1} | {c2} | {c3}\n"
-                        "  {d1} | {d2}".format(
+                        "  {c1:<24} | {c2:<21} | {c3:<17}\n"
+                        "  {d1:<24} | {d2:<21} |".format(
                             c1=row1_col1,
                             c2=row1_col2,
                             c3=row1_col3,
