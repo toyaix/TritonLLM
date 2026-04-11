@@ -619,13 +619,21 @@ class HarmonyChatTool:
 
                 decode_tps = token_num / decode_time if decode_time > 0 else 0.0
                 e2e_tps = token_num / elapsed if elapsed > 0 else 0.0
+                row1_col1 = f"{'Decode TPS:':<12}{decode_tps:.3f}"
+                row1_col2 = f"{'E2E TPS:':<10}{e2e_tps:.3f}"
+                row1_col3 = f"{'Generated:':<12}{token_num}"
+                row2_col1 = f"{'Decode:':<12}{decode_time * 1000:.1f} ms"
+                row2_col2 = f"{'Prefill:':<10}{prefill_time * 1000:.1f} ms"
                 print(
                     termcolor.colored(
-                        f"  Generated tokens: {token_num}\n"
-                        f"  Prefill:          {prefill_time * 1000:.3f} ms\n"
-                        f"  Decode:           {decode_time * 1000:.3f} ms\n"
-                        f"  Decode TPS:       {decode_tps:.3f}\n"
-                        f"  E2E TPS:          {e2e_tps:.3f}",
+                        "  {c1:<25} | {c2:<21} | {c3:<16}\n"
+                        "  {d1:<25} | {d2:<21} |".format(
+                            c1=row1_col1,
+                            c2=row1_col2,
+                            c3=row1_col3,
+                            d1=row2_col1,
+                            d2=row2_col2,
+                        ),
                         "yellow",
                     )
                 )

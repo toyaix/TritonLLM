@@ -315,7 +315,7 @@ def _matmul_ogs(
     if B is not None:
         BPtrs = B + expt_id * stride_b_e + offs_y_n
         if pid_k == 0:
-            bias = tl.load(BPtrs, mask=mask_n, other=0)
+            bias = tl.load(BPtrs, mask=mask_n, other=0).to(tl.float32)
         else:
             bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
     else:
