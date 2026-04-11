@@ -839,10 +839,12 @@ class TokenGenerator:
         logits = logits[-1]
         if temperature == 0.0:
             return logits.argmax().item()
-        self._sampling_probs.copy_(logits)
-        self._sampling_probs.div_(temperature)
-        torch.softmax(self._sampling_probs, dim=-1, out=self._sampling_probs)
-        return torch.multinomial(self._sampling_probs, num_samples=1).item()
+        # Gumbel-max trick: argmax(logits + T*Gumbel(0,1)) is distributed as
+        # categorical(softmax(logits/T)).  Avoids softmax's exp+normalize and
+        # multinomial's serial cumsum; argmax is a fast parallel tree-reduction.
+        # _sampling_probs is pre-allocated (vocab,) float32 on GPU.
+        self._sampling_probs.exponential_().log_().neg_().mul_(temperature).add_(logits)
+        return self._sampling_probs.argmax().item()
 
     def _handle_kv_capacity(self, decode_offset: int) -> tuple[bool, int]:
         if decode_offset < self.max_model_len:
