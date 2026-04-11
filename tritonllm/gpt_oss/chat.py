@@ -63,10 +63,10 @@ def get_user_input():
 
 
 def chat(args):
-    from .triton.model import TokenGenerator as TritonGenerator
     device = torch.device(f"cuda:0")
     tokenizer = get_tokenizer()
     checkpoint = get_model_with_checkpoint(args.checkpoint)
+    from .triton.model import TokenGenerator as TritonGenerator
     generator = TritonGenerator(checkpoint, args.context, device)
 
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
