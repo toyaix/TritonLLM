@@ -9,13 +9,20 @@ import argparse
 
 from pathlib import Path
 
+try:
+    import gnureadline as readline
+except ImportError:
+    import readline
+
 import torch
 import termcolor
 
+from tritonllm import __version__
 from gpt_oss.tools import apply_patch
 from gpt_oss.tools.simple_browser import SimpleBrowserTool
 from gpt_oss.tools.simple_browser.backend import ExaBackend
 from gpt_oss.tools.python_docker.docker_tool import PythonTool
+from gpt_oss.context_window import fit_messages_to_context
 from gpt_oss.tokenizer import get_tokenizer
 from tritonllm.utils import get_model_with_checkpoint
 
@@ -56,10 +63,10 @@ def get_user_input():
 
 
 def chat(args):
-    from .triton.model import TokenGenerator as TritonGenerator
     device = torch.device(f"cuda:0")
     tokenizer = get_tokenizer()
     checkpoint = get_model_with_checkpoint(args.checkpoint)
+    from .triton.model import TokenGenerator as TritonGenerator
     generator = TritonGenerator(checkpoint, args.context, device)
 
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
@@ -216,10 +223,27 @@ def chat(args):
                 else:
                     print(result[0].content[0].text)
 
-        conversation = Conversation.from_messages(messages)
-        tokens = encoding.render_conversation_for_completion(
-            conversation, Role.ASSISTANT
+        messages, tokens, dropped_messages, hard_truncated = fit_messages_to_context(
+            messages, encoding, generator.max_model_len
         )
+        if not args.raw and dropped_messages:
+            print(
+                termcolor.colored(
+                    f"Context exceeded {generator.max_model_len} tokens; "
+                    f"dropped {dropped_messages} old message(s) from history",
+                    "yellow",
+                ),
+                flush=True,
+            )
+        if not args.raw and hard_truncated:
+            print(
+                termcolor.colored(
+                    f"Latest prompt still exceeded {generator.max_model_len} tokens; "
+                    "left-truncated the tokenized prompt",
+                    "yellow",
+                ),
+                flush=True,
+            )
 
         if args.raw:
             # Print the last two tokens, which are the start of the assistant message
@@ -229,9 +253,16 @@ def chat(args):
         field_created = False
         current_output_text = ""
         output_text_delta_buffer = ""
+        inline_status_pending = not args.raw
+        if inline_status_pending:
+            print(termcolor.colored("Generating...", "yellow"), end="\r", flush=True)
         token_begin = time.perf_counter()
         token_num = 0
-        for predicted_token in generator.generate(tokens, encoding.stop_tokens_for_assistant_actions()):
+        for predicted_token in generator.generate(
+            tokens,
+            encoding.stop_tokens_for_assistant_actions(),
+            enable_repeat_pattern_stop=True,
+        ):
             token_num += 1
             parser.process(predicted_token)
             if args.raw:
@@ -246,6 +277,9 @@ def chat(args):
                 continue
 
             if not field_created:
+                if inline_status_pending:
+                    print("\r\033[K", end="", flush=True)
+                    inline_status_pending = False
                 field_created = True
                 if parser.current_channel == "final":
                     print(termcolor.colored("Assistant:", "green"), flush=True)
@@ -265,18 +299,33 @@ def chat(args):
                 print(output_text_delta_buffer, end="", flush=True)
                 current_output_text += output_text_delta_buffer
                 output_text_delta_buffer = ""
-        # token_num = len(tokenizer.encode(current_output_text))
-        # has 10 parser.last_content_delta
-        token_num -=  10
+        if inline_status_pending:
+            print("\r\033[K", end="", flush=True)
         token_end = time.perf_counter()
         elapsed = token_end - token_begin
-        print(termcolor.colored(f'TPS(Tokens Per Second) {token_num / elapsed:.3f}', "yellow"), flush=True)
+        generation_stats = generator.last_generation_stats or {}
+        generated_tokens = generation_stats.get("generated_tokens", token_num)
+        decode_time = generation_stats.get("decode_time_s", 0.0)
+        decode_tps = generated_tokens / decode_time if decode_time > 0 else 0.0
+        e2e_tps = generated_tokens / elapsed if elapsed > 0 else 0.0
+        print(
+            termcolor.colored(
+                f"Decode TPS: {decode_tps:.3f} | E2E TPS: {e2e_tps:.3f} | Generated: {generated_tokens}",
+                "yellow",
+            ),
+            flush=True,
+        )
         messages += parser.messages
 
 def get_parser_args():
     parser = argparse.ArgumentParser(
         description="Chat example",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "checkpoint",
@@ -331,8 +380,8 @@ def get_parser_args():
         "--context",
         metavar="CONTEXT",
         type=int,
-        default=8192,
-        help="Max context length",
+        default=131072,
+        help="Max context length (default: 131072)",
     )
     parser.add_argument(
         "--raw",

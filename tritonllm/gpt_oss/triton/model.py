@@ -837,6 +837,8 @@ class TokenGenerator:
         self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
         self.caches = [Cache(1, context, self.model.config.num_key_value_heads, device=self.device) for _ in range(len(self.model.block))]
         self.enable_dense_cache_sliding = all(cache.can_slide() for cache in self.caches)
+        repeat_stop_env = os.getenv("DENSE_REPEAT_PATTERN_STOP", "0").strip().lower()
+        self.enable_repeat_pattern_stop = repeat_stop_env not in {"0", "false", "no", "off", ""}
         self._dense_slide_warned = False
         self.input_token = torch.zeros(1, dtype=torch.int32, device=self.device)
         # warmup
@@ -931,8 +933,11 @@ class TokenGenerator:
                  stop_tokens: list[int] | None = None,
                  temperature: float = 1.0,
                  max_tokens: int = 0,
-                 return_logprobs: bool = False):
+                 return_logprobs: bool = False,
+                 enable_repeat_pattern_stop: bool | None = None):
         stop_tokens = stop_tokens or []
+        if enable_repeat_pattern_stop is None:
+            enable_repeat_pattern_stop = self.enable_repeat_pattern_stop
         self.last_generation_stats = None
         for cache in self.caches:
             cache.reset()
@@ -1000,19 +1005,20 @@ class TokenGenerator:
             else:
                 yield predicted_token
 
-            recent_generated_tokens.append(predicted_token)
-            if len(recent_generated_tokens) > 32:
-                recent_generated_tokens.pop(0)
-            if self._has_repeating_token_pattern(recent_generated_tokens):
-                loop_detected = True
-                print(
-                    termcolor.colored(
-                        "Stopping generation after detecting a repeating 2-8 token pattern in the last 32 tokens",
-                        "yellow",
-                    ),
-                    flush=True,
-                )
-                break
+            if enable_repeat_pattern_stop:
+                recent_generated_tokens.append(predicted_token)
+                if len(recent_generated_tokens) > 32:
+                    recent_generated_tokens.pop(0)
+                if self._has_repeating_token_pattern(recent_generated_tokens):
+                    loop_detected = True
+                    print(
+                        termcolor.colored(
+                            "Stopping generation after detecting a repeating 2-8 token pattern in the last 32 tokens",
+                            "yellow",
+                        ),
+                        flush=True,
+                    )
+                    break
             if predicted_token in stop_tokens:
                 break
         if self.device.type == "cuda":

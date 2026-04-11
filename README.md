@@ -1,5 +1,5 @@
 <h3 align="center">
-LLM Inference via Triton 🚀
+TritonLLM: LLM Inference via Triton 🚀
 </h3>
 
 <h4 align="center">
@@ -14,13 +14,19 @@ Flexible and modular LLM inference for mini-batch
 <a ><b>English</b></a> | <a href="README.zh.md"><b>中文</b></a>
 </p>
 
-Implements modular [Triton](https://github.com/triton-lang/triton)-backed LLM inference with an emphasis on kernel optimization using CUBINs. The initial target is the [gpt-oss](https://github.com/openai/gpt-oss) model, executed via [triton_runner](https://github.com/toyaix/triton_runner) and will be tuned for **RTX 5090** (sm120). Now support an NVIDIA GPU with [compute capability](https://developer.nvidia.com/cuda-gpus) sm120(RTX 5090, RTX PRO 6000, etc.), sm90(H100, H200, H20, etc.), sm80(A800, A100), sm89(RTX 4090, RTX 6000, L40, etc.) and sm86(RTX 3090, A10, etc.). If the GPU memory is greater than or equal to **24 GB**, you can run the **gpt-oss-20b**; if it is greater than or equal to **80 GB**, you can run the **gpt-oss-120b**.
+TritonLLM implements modular [Triton](https://github.com/triton-lang/triton)-backed LLM inference with an emphasis on kernel optimization using CUBINs. The initial target is the [gpt-oss](https://github.com/openai/gpt-oss) model, executed via [triton_runner](https://github.com/toyaix/triton_runner) and will be tuned for **RTX 5090** (sm120). Now support an NVIDIA GPU with [compute capability](https://developer.nvidia.com/cuda-gpus) sm120(RTX 5090, RTX PRO 6000, etc.), sm90(H100, H200, H20, etc.), sm80(A800, A100), sm89(RTX 4090, RTX 6000, L40, etc.) and sm86(RTX 3090, A10, etc.). If the GPU memory is greater than or equal to **24 GB**, you can run the **gpt-oss-20b**; if it is greater than or equal to **80 GB**, you can run the **gpt-oss-120b**.
 
-The project is compatible with PyTorch 2.10 and runs correctly in that environment. However, for the best performance, we recommend using PyTorch 2.8 together with Triton 3.4.0.
+The project is compatible with PyTorch 2.10 and runs correctly in that environment. However, for the best performance, we recommend using a PyTorch/Triton combination equivalent to PyTorch 2.8 with Triton 3.4.0.
 
 ## Quick Installation
 
-You can install the latest stable release of Triton from pip:
+Install a compatible PyTorch environment first, then install the latest stable release of `tritonllm` from pip. `tritonllm` does not pin `torch` or `triton` at package install time, so you can match versions to your CUDA driver and deployment environment:
+
+```shell
+pip install torch
+```
+
+Then install `tritonllm`:
 
 ```shell
 pip install tritonllm

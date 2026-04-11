@@ -1,6 +1,7 @@
 import urllib.request
 import os
 import sys
+import time
 from tritonllm import gpt_oss, triton_kernels
 from tritonllm.jit_backend import configure_jit_backend
 from pathlib import Path
@@ -22,16 +23,74 @@ def open_url(url):
     return urllib.request.urlopen(request, timeout=300)
 
 
+def _download_file_with_progress(url: str, save_as: str, chunk_size: int = 1 << 20) -> None:
+    os.makedirs(os.path.dirname(save_as), exist_ok=True)
+    with open_url(url) as response:
+        total_size = response.headers.get("Content-Length")
+        total_size = int(total_size) if total_size else None
+        downloaded = 0
+        last_report = 0.0
+        started_at = time.perf_counter()
+        tmp_path = f"{save_as}.tmp"
+
+        print(f"Downloading {os.path.basename(save_as)}...", flush=True)
+        try:
+            with open(tmp_path, "wb") as f:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+                    now = time.perf_counter()
+                    if now - last_report < 0.2 and total_size is not None and downloaded < total_size:
+                        continue
+                    last_report = now
+
+                    downloaded_mb = downloaded / (1024 * 1024)
+                    if total_size:
+                        total_mb = total_size / (1024 * 1024)
+                        percent = downloaded * 100.0 / total_size
+                        print(
+                            f"Downloading {os.path.basename(save_as)}: "
+                            f"{downloaded_mb:.1f}/{total_mb:.1f} MiB ({percent:.1f}%)",
+                            end="\r",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"Downloading {os.path.basename(save_as)}: {downloaded_mb:.1f} MiB",
+                            end="\r",
+                            flush=True,
+                        )
+            os.replace(tmp_path, save_as)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+    elapsed = time.perf_counter() - started_at
+    downloaded_mb = downloaded / (1024 * 1024)
+    speed_mbps = downloaded_mb / elapsed if elapsed > 0 else 0.0
+    print(
+        f"Downloaded {os.path.basename(save_as)}: {downloaded_mb:.1f} MiB "
+        f"in {elapsed:.1f}s ({speed_mbps:.1f} MiB/s)      ",
+        flush=True,
+    )
+
+
 def save_file_to_tritonllm_bin_dir(tritonllm_bin_dir):
     os.makedirs(tritonllm_bin_dir, exist_ok=True)
     url = "https://tritonllm.top/down/o200k_base.tiktoken"
     save_as = os.path.join(tritonllm_bin_dir, "fb374d419588a4632f3f557e76b4b70aebbca790")
     if not os.path.exists(save_as):
-        with open_url(url) as response:
-            content = response.read()
+        _download_file_with_progress(url, save_as)
 
-        with open(save_as, "wb") as f:
-            f.write(content)
+
+def _env_flag_enabled(name: str) -> bool:
+    value = os.getenv(name, "0").strip().lower()
+    return value not in {"0", "false", "no", "off", ""}
 
 temp_dir = tempfile.gettempdir()
 
@@ -82,10 +141,9 @@ def init_env():
     sys.modules['gpt_oss'] = gpt_oss
 
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    # os.environ["TIKTOKEN_CACHE_DIR"] = tritonllm_bin_dir
-
-    # download o200k_base.tiktoken
-    # save_file_to_tritonllm_bin_dir(tritonllm_bin_dir)
+    if _env_flag_enabled("TRITONLLM_DOWNLOAD_TIKTOKEN"):
+        os.environ.setdefault("TIKTOKEN_CACHE_DIR", tritonllm_bin_dir)
+        save_file_to_tritonllm_bin_dir(tritonllm_bin_dir)
 
 if triton.__version__ == "3.4.0":
     constexpr_function = tl.constexpr_function
