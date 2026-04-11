@@ -3,5 +3,7 @@
 from tritonllm.jit_backend import configure_jit_backend
 from tritonllm.utils import init_env
 
+__version__ = "0.1.1"
+
 configure_jit_backend()
 init_env()

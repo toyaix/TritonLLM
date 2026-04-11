@@ -20,20 +20,19 @@ dependencies = [
   "torch>=2.7.0",
   "triton>=3.4.0",
   "safetensors>=0.5.3",
-  "pytest>=8.4.1",
   "modelscope>=1.29.0",
   "numpy>=2.3.2",
 ]
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
-version = "0.1.0"
+version = "0.1.1"
 authors = [
     { name = "Bob Huang", email = "git@bobhuang.xyz" },
 ]
 license = "MIT"
 
 [project.urls]
-repository = "https://github.com/toyaix/TritonLLM"
+repository = "https://github.com/toyaix/tritonllm"
 homepage = "https://tritonllm.top"
 
 [build-system]
@@ -46,6 +45,9 @@ include-package-data = true
 [project.optional-dependencies]
 runner = [
   "triton-runner>=0.3.5",
+]
+test = [
+  "pytest>=8.4.1",
 ]
 
 [tool.setuptools.package-data]

@@ -12,6 +12,7 @@ from pathlib import Path
 import torch
 import termcolor
 
+from tritonllm import __version__
 from gpt_oss.tools import apply_patch
 from gpt_oss.tools.simple_browser import SimpleBrowserTool
 from gpt_oss.tools.simple_browser.backend import ExaBackend
@@ -277,6 +278,11 @@ def get_parser_args():
     parser = argparse.ArgumentParser(
         description="Chat example",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "checkpoint",
