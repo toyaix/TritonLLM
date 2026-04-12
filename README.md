@@ -102,10 +102,10 @@ pip install -e ".[runner]"
 By default the project keeps using `@triton.jit`. To switch the package-managed kernels to `@triton_runner.jit`, set:
 
 ```shell
-export TRITONLLM_JIT_BACKEND=triton_runner
+export TRITON_RUNNER_PROD=1
 ```
 
-Supported values are `triton` and `triton_runner`. If `triton_runner` is selected without the optional dependency installed, the import will fail fast with a clear error.
+If `triton_runner` is selected without the optional dependency installed, the import will fail fast with a clear error.
 
 ## example code
 

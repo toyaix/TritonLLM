@@ -4,10 +4,9 @@ import os
 import triton
 
 
-JIT_BACKEND_ENV_VAR = "TRITONLLM_JIT_BACKEND"
+PROD_ENV_VAR = "TRITON_RUNNER_PROD"
 DEFAULT_JIT_BACKEND = "triton"
 RUNNER_JIT_BACKEND = "triton_runner"
-SUPPORTED_JIT_BACKENDS = frozenset({DEFAULT_JIT_BACKEND, RUNNER_JIT_BACKEND})
 
 _ORIGINAL_TRITON_JIT = triton.jit
 _configured_backend_name = None
@@ -15,15 +14,9 @@ _configured_backend_module = None
 
 
 def _read_backend_name():
-    value = os.environ.get(JIT_BACKEND_ENV_VAR, DEFAULT_JIT_BACKEND)
-    backend_name = value.strip().lower() or DEFAULT_JIT_BACKEND
-    if backend_name not in SUPPORTED_JIT_BACKENDS:
-        supported = ", ".join(sorted(SUPPORTED_JIT_BACKENDS))
-        raise RuntimeError(
-            f"Unsupported {JIT_BACKEND_ENV_VAR}={value!r}. "
-            f"Expected one of: {supported}."
-        )
-    return backend_name
+    if os.environ.get(PROD_ENV_VAR, "") == "1":
+        return RUNNER_JIT_BACKEND
+    return DEFAULT_JIT_BACKEND
 
 
 def _load_backend_module(backend_name):
@@ -33,7 +26,7 @@ def _load_backend_module(backend_name):
         return importlib.import_module(RUNNER_JIT_BACKEND)
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            f"{JIT_BACKEND_ENV_VAR}={RUNNER_JIT_BACKEND} requires the optional "
+            f"{PROD_ENV_VAR}=1 requires the optional "
             "dependency `triton-runner>=0.3.4`. Install it directly or via "
             "`tritonllm[runner]`."
         ) from exc

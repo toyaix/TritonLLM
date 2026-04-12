@@ -109,10 +109,10 @@ pip install -e ".[runner]"
 项目默认仍然使用 `@triton.jit`。如果想让仓库内部管理的 kernel 在导入时切换到 `@triton_runner.jit`，设置：
 
 ```shell
-export TRITONLLM_JIT_BACKEND=triton_runner
+export TRITON_RUNNER_PROD=1
 ```
 
-支持的取值为 `triton` 和 `triton_runner`。如果选择了 `triton_runner` 但没有安装可选依赖，导入时会直接报错，不会静默回退。
+如果选择了 `triton_runner` 但没有安装可选依赖，导入时会直接报错，不会静默回退。
 
 ## 样例
 
