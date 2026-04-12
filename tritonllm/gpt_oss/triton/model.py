@@ -833,6 +833,7 @@ class TokenGenerator:
     @torch.inference_mode()
     def __init__(self, checkpoint: str, context: int, device: torch.device):
         self.device = device
+        self.use_cuda_graph = os.getenv("CUDA_GRAPH", "1").strip().lower() not in {"0", "false", "no", "off"}
         print(termcolor.colored("Loading model checkpoint...", "yellow"), flush=True)
         self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
         self.caches = [Cache(1, context, self.model.config.num_key_value_heads, device=self.device) for _ in range(len(self.model.block))]
@@ -843,11 +844,16 @@ class TokenGenerator:
         self.input_token = torch.zeros(1, dtype=torch.int32, device=self.device)
         # warmup
         self.model(self.input_token[None, :], caches=self.caches)
-        # capture for sampling
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
-        self._sampling_probs = torch.empty_like(self.logits[0])
+        if self.use_cuda_graph:
+            # capture for sampling
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
+        else:
+            self.graph = None
+            self.logits = None
+            print(termcolor.colored("CUDA Graph disabled, using eager mode", "yellow"), flush=True)
+        self._sampling_probs = torch.empty(self.model.config.vocab_size, device=self.device, dtype=torch.bfloat16)
         self.last_generation_stats = None
         if self.enable_dense_cache_sliding:
             print(
@@ -979,7 +985,10 @@ class TokenGenerator:
                     if not can_continue:
                         return
                     self.input_token[0] = predicted_token
-                    self.graph.replay()
+                    if self.use_cuda_graph:
+                        self.graph.replay()
+                    else:
+                        self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
                     self.sample_next_token(self.logits, temperature)
             self.last_generation_stats = {
                 "generated_tokens": 0,
@@ -996,7 +1005,10 @@ class TokenGenerator:
             if not can_continue:
                 break
             self.input_token[0] = predicted_token
-            self.graph.replay()
+            if self.use_cuda_graph:
+                self.graph.replay()
+            else:
+                self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
             predicted_token = self.sample_next_token(self.logits, temperature)
             decode_offset += 1
             num_generated_tokens += 1
