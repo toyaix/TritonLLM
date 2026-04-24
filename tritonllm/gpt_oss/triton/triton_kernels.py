@@ -23,13 +23,14 @@ def rmsnorm_kernel(x_ptr, t_ptr, scale_ptr, last_dim, eps, BLOCK_SIZE: tl.conste
     tl.store(t_ptr + offset, y, mask=offset < last_dim)
 
 
-def rmsnorm_forward(x, scale, eps):
-    t = torch.empty_like(x)
+def rmsnorm_forward(x, scale, eps, out=None):
+    if out is None:
+        out = torch.empty_like(x)
     *prefix_shape, last_dim = x.shape
     rows_total = math.prod(prefix_shape)
     grid = lambda META: (rows_total, triton.cdiv(last_dim, META['BLOCK_SIZE']))
-    rmsnorm_kernel[grid](x, t, scale, last_dim, eps, BLOCK_SIZE=512)
-    return t
+    rmsnorm_kernel[grid](x, out, scale, last_dim, eps, BLOCK_SIZE=512)
+    return out
 
 
 @triton.jit
@@ -1097,7 +1098,9 @@ def out_residual_decode_forward(hidden, weight, bias, residual):
     if residual.stride(-1) != 1:
         residual = residual.contiguous()
 
-    out = torch.empty((batch, hidden_size), device=hidden.device, dtype=hidden.dtype)
+    out = residual.reshape(batch, hidden_size)
+    if out.stride(-1) != 1:
+        out = out.contiguous()
     grid = lambda META: (triton.cdiv(hidden_size, META["BLOCK_OUT"]), batch)
     out_residual_decode_kernel[grid](
         hidden,

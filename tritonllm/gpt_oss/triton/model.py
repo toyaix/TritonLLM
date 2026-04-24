@@ -715,7 +715,8 @@ class MLPBlock(torch.nn.Module):
             )
         t = t.view(batch_size, n_ctx, dim)
 
-        return x + t
+        x.add_(t)
+        return x
 
 
 class TransformerBlock(torch.nn.Module):

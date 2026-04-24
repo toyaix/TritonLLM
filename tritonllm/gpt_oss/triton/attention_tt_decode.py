@@ -304,7 +304,7 @@ class _attention_decode(torch.autograd.Function):
         v = v.contiguous()
         o = torch.empty_like(q)
 
-        BLOCK_N = 64
+        BLOCK_N = 128
         # Use split-K for long KV sequences to parallelize across SMs
         if n_kv_ctx <= 1024:
             SPLIT_K = 1

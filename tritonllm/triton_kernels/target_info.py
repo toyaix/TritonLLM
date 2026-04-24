@@ -93,9 +93,7 @@ def num_sms():
 
 @constexpr_function
 def has_tma_gather():
-    # TMA gather/scatter with .shared::cluster requires data center Blackwell (sm_100x).
-    # Not available on consumer Blackwell sm_120a (RTX 5090).
-    return cuda_capability_geq(10, 0) and not cuda_capability_eq(12, 0)
+    return cuda_capability_geq(10, 0)
 
 
 @constexpr_function
