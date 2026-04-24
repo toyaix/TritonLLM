@@ -26,6 +26,8 @@ from gpt_oss.triton.triton_kernels import (
     rmsnorm_forward,
     rope_forward,
     unembedding_decode_forward,
+    unembedding_decode_fp8_forward,
+    _quantize_unembed_fp8,
 )
 
 @dataclass
@@ -71,6 +73,11 @@ class UnEmbedding(torch.nn.Module):
         self.weight = torch.nn.Parameter(
             torch.empty((vocab_size, hidden_size), device=device, dtype=torch.bfloat16)
         )
+        self._use_fp8 = os.getenv("UNEMBED_FP8", "0").strip().lower() not in {
+            "0", "false", "no", "off",
+        }
+        self._weight_fp8: torch.Tensor | None = None
+        self._weight_scale: torch.Tensor | None = None
 
     @record_function("unembedding_linear")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -81,6 +88,10 @@ class UnEmbedding(torch.nn.Module):
             and x.dtype == torch.bfloat16
             and self.weight.dtype == torch.bfloat16
         ):
+            if self._use_fp8:
+                if self._weight_fp8 is None:
+                    self._weight_fp8, self._weight_scale = _quantize_unembed_fp8(self.weight)
+                return unembedding_decode_fp8_forward(x, self._weight_fp8, self._weight_scale)
             return unembedding_decode_forward(x, self.weight)
         return torch.nn.functional.linear(x, self.weight, bias=None)
 

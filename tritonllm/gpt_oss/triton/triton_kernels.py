@@ -197,6 +197,107 @@ def unembedding_decode_forward(hidden, weight):
     return logits[:, None, :]
 
 
+@triton.jit
+def unembedding_decode_fp8_kernel(
+    hidden_ptr,
+    weight_fp8_ptr,
+    weight_scale_ptr,
+    logits_ptr,
+    vocab_size,
+    hidden_size,
+    stride_hidden_batch,
+    stride_hidden_dim,
+    stride_weight_vocab,
+    stride_weight_dim,
+    stride_scale,
+    stride_logits_batch,
+    stride_logits_vocab,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Same as unembedding_decode_kernel but weight is FP8 E4M3 with per-row scale."""
+    pid_vocab = tl.program_id(0)
+    pid_batch = tl.program_id(1)
+
+    offs_vocab = pid_vocab * BLOCK_V + tl.arange(0, BLOCK_V)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    hidden_ptr = hidden_ptr + pid_batch.to(tl.int64) * stride_hidden_batch
+    logits_ptr = logits_ptr + pid_batch.to(tl.int64) * stride_logits_batch
+
+    # Per-row dequant scales
+    scales = tl.load(
+        weight_scale_ptr + offs_vocab.to(tl.int64) * stride_scale,
+        mask=offs_vocab < vocab_size,
+        other=1.0,
+    )
+
+    acc = tl.zeros((BLOCK_V,), dtype=tl.float32)
+
+    for k_start in range(0, hidden_size, BLOCK_K):
+        k_offsets = k_start + offs_k
+        hidden = tl.load(
+            hidden_ptr + k_offsets.to(tl.int64) * stride_hidden_dim,
+            mask=k_offsets < hidden_size,
+            other=0,
+        )
+        # Load FP8 weight → Triton auto-converts to fp32
+        weight_tile = tl.load(
+            weight_fp8_ptr
+            + offs_vocab[:, None].to(tl.int64) * stride_weight_vocab
+            + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
+            mask=(offs_vocab[:, None] < vocab_size) & (k_offsets[None, :] < hidden_size),
+            other=0,
+        )
+        acc += tl.sum(weight_tile * hidden[None, :] * scales[:, None], axis=1)
+
+    tl.store(
+        logits_ptr + offs_vocab.to(tl.int64) * stride_logits_vocab,
+        acc.to(logits_ptr.type.element_ty),
+        mask=offs_vocab < vocab_size,
+    )
+
+
+def _quantize_unembed_fp8(weight_bf16: torch.Tensor):
+    """Per-row FP8 E4M3 quantization. Returns (weight_fp8, scale_fp32)."""
+    w_fp32 = weight_bf16.to(torch.float32)
+    max_fp8 = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+    amax = w_fp32.abs().max(dim=1, keepdim=True).values.clamp(min=1e-12)
+    scale = (amax / max_fp8).squeeze(1).to(torch.float32)
+    w_fp8 = (w_fp32 / scale[:, None].clamp(min=1e-12)).to(torch.float8_e4m3fn)
+    return w_fp8, scale
+
+
+def unembedding_decode_fp8_forward(hidden, weight_fp8, weight_scale):
+    batch, num_tokens, hidden_size = hidden.shape
+    vocab_size, hidden_size_weight = weight_fp8.shape
+    assert num_tokens == 1
+    assert hidden_size == hidden_size_weight
+
+    hidden = hidden.reshape(batch, hidden_size)
+    if hidden.stride(-1) != 1:
+        hidden = hidden.contiguous()
+
+    logits = _pool_get((batch, vocab_size), hidden.dtype, hidden.device)
+    grid = lambda META: (triton.cdiv(vocab_size, META["BLOCK_V"]), batch)
+    unembedding_decode_fp8_kernel[grid](
+        hidden,
+        weight_fp8,
+        weight_scale,
+        logits,
+        vocab_size,
+        hidden_size,
+        hidden.stride(0),
+        hidden.stride(1),
+        weight_fp8.stride(0),
+        weight_fp8.stride(1),
+        weight_scale.stride(0),
+        logits.stride(0),
+        logits.stride(1),
+    )
+    return logits[:, None, :]
+
+
 def unembedding_forward(hidden, weight):
     if (
         hidden.is_cuda
