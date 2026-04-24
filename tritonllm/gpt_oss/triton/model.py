@@ -59,8 +59,8 @@ class RMSNorm(torch.nn.Module):
         )
 
     @record_function("rmsnorm_triton")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return rmsnorm_forward(x, self.scale, self.eps)
+    def forward(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        return rmsnorm_forward(x, self.scale, self.eps, out=out)
 
 
 class UnEmbedding(torch.nn.Module):
@@ -762,7 +762,7 @@ class Transformer(torch.nn.Module):
         x = self.embedding(x)
         for block, cache in zip(self.block, caches):
             x = block(x, cache=cache)
-        return self.norm(x)
+        return self.norm(x, out=x)
 
     def forward(self, x: torch.Tensor, caches: list[Cache] | None = None) -> torch.Tensor:
         x = self._forward_hidden(x, caches)

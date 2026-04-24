@@ -3,6 +3,8 @@ import triton
 import triton.language as tl
 import math
 
+from gpt_oss.triton.scratch_pool import get as _pool_get
+
 
 @triton.jit
 def rmsnorm_kernel(x_ptr, t_ptr, scale_ptr, last_dim, eps, BLOCK_SIZE: tl.constexpr):
@@ -25,7 +27,7 @@ def rmsnorm_kernel(x_ptr, t_ptr, scale_ptr, last_dim, eps, BLOCK_SIZE: tl.conste
 
 def rmsnorm_forward(x, scale, eps, out=None):
     if out is None:
-        out = torch.empty_like(x)
+        out = _pool_get(tuple(x.shape), x.dtype, x.device)
     *prefix_shape, last_dim = x.shape
     rows_total = math.prod(prefix_shape)
     grid = lambda META: (rows_total, triton.cdiv(last_dim, META['BLOCK_SIZE']))
@@ -177,7 +179,7 @@ def unembedding_decode_forward(hidden, weight):
     if weight.stride(-1) != 1:
         weight = weight.contiguous()
 
-    logits = torch.empty((batch, vocab_size), device=hidden.device, dtype=hidden.dtype)
+    logits = _pool_get((batch, vocab_size), hidden.dtype, hidden.device)
     grid = lambda META: (triton.cdiv(vocab_size, META["BLOCK_V"]), batch)
     unembedding_decode_kernel[grid](
         hidden,
@@ -316,9 +318,9 @@ def qkv_decode_forward(hidden, weight, bias, q_dim, kv_dim):
     if bias.stride(0) != 1:
         bias = bias.contiguous()
 
-    q = torch.empty((batch, q_dim), device=hidden.device, dtype=hidden.dtype)
-    k = torch.empty((batch, kv_dim), device=hidden.device, dtype=hidden.dtype)
-    v = torch.empty((batch, kv_dim), device=hidden.device, dtype=hidden.dtype)
+    q = _pool_get((batch, q_dim), hidden.dtype, hidden.device)
+    k = _pool_get((batch, kv_dim), hidden.dtype, hidden.device)
+    v = _pool_get((batch, kv_dim), hidden.dtype, hidden.device)
 
     grid = lambda META: (triton.cdiv(total_out, META["BLOCK_OUT"]), batch)
     qkv_decode_kernel[grid](
@@ -790,7 +792,8 @@ def qkv_rope_cache_decode_forward(
     if cos.stride(-1) != 1:
         cos = cos.contiguous()
 
-    q = torch.empty((batch, num_q_heads, head_dim), device=hidden.device, dtype=hidden.dtype)
+    q_shape = (batch, num_q_heads, head_dim)
+    q = _pool_get(q_shape, hidden.dtype, hidden.device)
 
     total_heads = num_q_heads + 2 * num_kv_heads
     SPLIT_K = 4 if hidden_size > 512 else 1
@@ -835,7 +838,7 @@ def qkv_rope_cache_decode_forward(
             HEAD_DIM=head_dim,
         )
     else:
-        partial = torch.empty((SPLIT_K, batch, total_heads, head_dim), device=hidden.device, dtype=torch.float32)
+        partial = _pool_get((SPLIT_K, batch, total_heads, head_dim), torch.float32, hidden.device)
         qkv_decode_splitk_kernel[(total_heads, batch, SPLIT_K)](
             hidden,
             weight,
