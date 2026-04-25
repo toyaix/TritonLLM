@@ -672,6 +672,7 @@ def qkv_decode_forward(hidden, weight, bias, q_dim, kv_dim):
 def qkv_rope_cache_decode_kernel(
     hidden_ptr,
     weight_ptr,
+    weight_scale_ptr,
     bias_ptr,
     sin_ptr,
     cos_ptr,
@@ -686,6 +687,7 @@ def qkv_rope_cache_decode_kernel(
     stride_hidden_dim,
     stride_weight_out,
     stride_weight_dim,
+    stride_scale,
     stride_bias_out,
     stride_sin_ctx,
     stride_sin_dim,
@@ -705,6 +707,7 @@ def qkv_rope_cache_decode_kernel(
     max_context_length,
     HEAD_DIM: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    USE_FP8_WEIGHT: tl.constexpr,
 ):
     pid_head = tl.program_id(0)
     pid_batch = tl.program_id(1)
@@ -742,6 +745,21 @@ def qkv_rope_cache_decode_kernel(
     acc_lo = tl.zeros((HEAD_DIM // 2,), dtype=tl.float32)
     acc_hi = tl.zeros((HEAD_DIM // 2,), dtype=tl.float32)
 
+    if USE_FP8_WEIGHT:
+        weight_scales_lo = tl.load(
+            weight_scale_ptr + out_offsets_lo.to(tl.int64) * stride_scale,
+            mask=out_mask_lo,
+            other=1.0,
+        )
+        weight_scales_hi = tl.load(
+            weight_scale_ptr + out_offsets_hi.to(tl.int64) * stride_scale,
+            mask=out_mask_hi,
+            other=1.0,
+        )
+        weight_other = 0.0
+    else:
+        weight_other = 0
+
     for k_start in range(0, hidden_size, BLOCK_K):
         k_offsets = k_start + offs_k
         hidden = tl.load(
@@ -754,15 +772,18 @@ def qkv_rope_cache_decode_kernel(
             + out_offsets_lo[:, None].to(tl.int64) * stride_weight_out
             + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
             mask=out_mask_lo[:, None] & (k_offsets[None, :] < hidden_size),
-            other=0,
+            other=weight_other,
         )
         weight_hi = tl.load(
             weight_ptr
             + out_offsets_hi[:, None].to(tl.int64) * stride_weight_out
             + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
             mask=out_mask_hi[:, None] & (k_offsets[None, :] < hidden_size),
-            other=0,
+            other=weight_other,
         )
+        if USE_FP8_WEIGHT:
+            weight_lo = weight_lo * weight_scales_lo[:, None]
+            weight_hi = weight_hi * weight_scales_hi[:, None]
         acc_lo += tl.sum(weight_lo * hidden[None, :], axis=1)
         acc_hi += tl.sum(weight_hi * hidden[None, :], axis=1)
 
@@ -845,6 +866,7 @@ def qkv_rope_cache_decode_kernel(
 def qkv_decode_splitk_kernel(
     hidden_ptr,
     weight_ptr,
+    weight_scale_ptr,
     partial_ptr,
     hidden_size,
     num_q_heads,
@@ -853,10 +875,12 @@ def qkv_decode_splitk_kernel(
     stride_hidden_dim,
     stride_weight_out,
     stride_weight_dim,
+    stride_scale,
     BS,
     HEAD_DIM: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    USE_FP8_WEIGHT: tl.constexpr,
 ):
     pid_head = tl.program_id(0)
     pid_batch = tl.program_id(1)
@@ -900,6 +924,21 @@ def qkv_decode_splitk_kernel(
     acc_lo = tl.zeros((HEAD_DIM // 2,), dtype=tl.float32)
     acc_hi = tl.zeros((HEAD_DIM // 2,), dtype=tl.float32)
 
+    if USE_FP8_WEIGHT:
+        weight_scales_lo = tl.load(
+            weight_scale_ptr + out_offsets_lo.to(tl.int64) * stride_scale,
+            mask=out_mask_lo,
+            other=1.0,
+        )
+        weight_scales_hi = tl.load(
+            weight_scale_ptr + out_offsets_hi.to(tl.int64) * stride_scale,
+            mask=out_mask_hi,
+            other=1.0,
+        )
+        weight_other = 0.0
+    else:
+        weight_other = 0
+
     for k_start in range(k_lo, k_hi, BLOCK_K):
         k_offsets = k_start + offs_k
         hidden = tl.load(
@@ -912,15 +951,18 @@ def qkv_decode_splitk_kernel(
             + out_offsets_lo[:, None].to(tl.int64) * stride_weight_out
             + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
             mask=out_mask_lo[:, None] & (k_offsets[None, :] < hidden_size),
-            other=0,
+            other=weight_other,
         )
         weight_hi = tl.load(
             weight_ptr
             + out_offsets_hi[:, None].to(tl.int64) * stride_weight_out
             + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
             mask=out_mask_hi[:, None] & (k_offsets[None, :] < hidden_size),
-            other=0,
+            other=weight_other,
         )
+        if USE_FP8_WEIGHT:
+            weight_lo = weight_lo * weight_scales_lo[:, None]
+            weight_hi = weight_hi * weight_scales_hi[:, None]
         acc_lo += tl.sum(weight_lo * hidden[None, :], axis=1)
         acc_hi += tl.sum(weight_hi * hidden[None, :], axis=1)
 
@@ -1077,6 +1119,7 @@ def qkv_rope_cache_decode_forward(
     num_q_heads,
     num_kv_heads,
     head_dim,
+    weight_scale=None,
 ):
     batch, num_tokens, hidden_size = hidden.shape
     total_out, hidden_size_weight = weight.shape
@@ -1090,6 +1133,8 @@ def qkv_rope_cache_decode_forward(
     assert cache_k.shape[2] == num_kv_heads
     assert cache_k.shape[3] == head_dim
     assert offset.shape == (1,)
+
+    use_fp8 = weight_scale is not None
 
     hidden = hidden.reshape(batch, hidden_size)
     if hidden.stride(-1) != 1:
@@ -1115,6 +1160,7 @@ def qkv_rope_cache_decode_forward(
         qkv_rope_cache_decode_kernel[grid](
             hidden,
             weight,
+            weight_scale if use_fp8 else weight,
             bias,
             sin,
             cos,
@@ -1129,6 +1175,7 @@ def qkv_rope_cache_decode_forward(
             hidden.stride(1),
             weight.stride(0),
             weight.stride(1),
+            0 if not use_fp8 else (weight_scale.stride(0) if weight_scale is not None else 0),
             bias.stride(0),
             sin.stride(0),
             sin.stride(1),
@@ -1147,12 +1194,14 @@ def qkv_rope_cache_decode_forward(
             cache_v.stride(3),
             max_context_length,
             HEAD_DIM=head_dim,
+            USE_FP8_WEIGHT=use_fp8,
         )
     else:
         partial = _pool_get((SPLIT_K, batch, total_heads, head_dim), torch.float32, hidden.device)
         qkv_decode_splitk_kernel[(total_heads, batch, SPLIT_K)](
             hidden,
             weight,
+            weight_scale if use_fp8 else weight,
             partial,
             hidden_size,
             num_q_heads,
@@ -1161,10 +1210,12 @@ def qkv_rope_cache_decode_forward(
             hidden.stride(1),
             weight.stride(0),
             weight.stride(1),
+            0 if not use_fp8 else (weight_scale.stride(0) if weight_scale is not None else 0),
             batch,
             HEAD_DIM=head_dim,
             BLOCK_K=BLOCK_K,
             SPLIT_K=SPLIT_K,
+            USE_FP8_WEIGHT=use_fp8,
             num_warps=4,
             num_stages=2,
         )
@@ -1218,6 +1269,7 @@ def qkv_rope_cache_decode_forward(
 def out_residual_decode_kernel(
     hidden_ptr,
     weight_ptr,
+    weight_scale_ptr,
     bias_ptr,
     residual_ptr,
     out_ptr,
@@ -1227,6 +1279,7 @@ def out_residual_decode_kernel(
     stride_hidden_dim,
     stride_weight_out,
     stride_weight_dim,
+    stride_scale,
     stride_bias_dim,
     stride_residual_batch,
     stride_residual_dim,
@@ -1234,6 +1287,7 @@ def out_residual_decode_kernel(
     stride_out_dim,
     BLOCK_OUT: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    USE_FP8_WEIGHT: tl.constexpr,
 ):
     pid_out = tl.program_id(0)
     pid_batch = tl.program_id(1)
@@ -1248,6 +1302,13 @@ def out_residual_decode_kernel(
     acc = tl.zeros((BLOCK_OUT,), dtype=tl.float32)
     out_mask = offs_out < hidden_size
 
+    if USE_FP8_WEIGHT:
+        weight_scales = tl.load(
+            weight_scale_ptr + offs_out.to(tl.int64) * stride_scale,
+            mask=out_mask,
+            other=1.0,
+        )
+
     for k_start in range(0, out_dim, BLOCK_K):
         k_offsets = k_start + offs_k
         hidden = tl.load(
@@ -1260,8 +1321,10 @@ def out_residual_decode_kernel(
             + offs_out[:, None].to(tl.int64) * stride_weight_out
             + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
             mask=out_mask[:, None] & (k_offsets[None, :] < out_dim),
-            other=0,
+            other=0.0 if USE_FP8_WEIGHT else 0,
         )
+        if USE_FP8_WEIGHT:
+            weight = weight * weight_scales[:, None]
         acc += tl.sum(weight * hidden[None, :], axis=1)
 
     bias = tl.load(
@@ -1287,6 +1350,7 @@ def out_residual_decode_kernel(
 def out_residual_decode_splitk_kernel(
     hidden_ptr,
     weight_ptr,
+    weight_scale_ptr,
     partial_ptr,
     hidden_size,
     out_dim,
@@ -1294,10 +1358,12 @@ def out_residual_decode_splitk_kernel(
     stride_hidden_dim,
     stride_weight_out,
     stride_weight_dim,
+    stride_scale,
     BS,
     BLOCK_OUT: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    USE_FP8_WEIGHT: tl.constexpr,
 ):
     pid_out = tl.program_id(0)
     pid_batch = tl.program_id(1)
@@ -1316,6 +1382,13 @@ def out_residual_decode_splitk_kernel(
     hidden_ptr = hidden_ptr + pid_batch.to(tl.int64) * stride_hidden_batch
     acc = tl.zeros((BLOCK_OUT,), dtype=tl.float32)
 
+    if USE_FP8_WEIGHT:
+        weight_scales = tl.load(
+            weight_scale_ptr + offs_out.to(tl.int64) * stride_scale,
+            mask=out_mask,
+            other=1.0,
+        )
+
     for k_start in range(k_lo, k_hi, BLOCK_K):
         k_offsets = k_start + offs_k
         hidden = tl.load(
@@ -1328,8 +1401,10 @@ def out_residual_decode_splitk_kernel(
             + offs_out[:, None].to(tl.int64) * stride_weight_out
             + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
             mask=out_mask[:, None] & (k_offsets[None, :] < out_dim),
-            other=0,
+            other=0.0 if USE_FP8_WEIGHT else 0,
         )
+        if USE_FP8_WEIGHT:
+            weight = weight * weight_scales[:, None]
         acc += tl.sum(weight * hidden[None, :], axis=1)
 
     # Store partial: layout (SPLIT_K, BS, hidden_size)
@@ -1392,7 +1467,7 @@ def out_residual_decode_reduce_kernel(
     )
 
 
-def out_residual_decode_forward(hidden, weight, bias, residual):
+def out_residual_decode_forward(hidden, weight, bias, residual, weight_scale=None):
     batch, num_tokens, out_dim_hidden = hidden.shape
     hidden_size, out_dim_weight = weight.shape
 
@@ -1400,6 +1475,8 @@ def out_residual_decode_forward(hidden, weight, bias, residual):
     assert out_dim_hidden == out_dim_weight
     assert bias.shape == (hidden_size,)
     assert residual.shape == (batch, 1, hidden_size)
+
+    use_fp8 = weight_scale is not None
 
     hidden = hidden.reshape(batch, out_dim_hidden)
     residual = residual.reshape(batch, hidden_size)
@@ -1419,6 +1496,7 @@ def out_residual_decode_forward(hidden, weight, bias, residual):
     out_residual_decode_kernel[grid](
         hidden,
         weight,
+        weight_scale if use_fp8 else weight,
         bias,
         residual,
         out,
@@ -1428,10 +1506,12 @@ def out_residual_decode_forward(hidden, weight, bias, residual):
         hidden.stride(1),
         weight.stride(0),
         weight.stride(1),
+        0 if not use_fp8 else (weight_scale.stride(0) if weight_scale is not None else 0),
         bias.stride(0),
         residual.stride(0),
         residual.stride(1),
         out.stride(0),
         out.stride(1),
+        USE_FP8_WEIGHT=use_fp8,
     )
     return out[:, None, :]

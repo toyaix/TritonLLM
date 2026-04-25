@@ -126,6 +126,11 @@ class QKV(torch.nn.Module):
         self.bias = torch.nn.Parameter(
             torch.empty((qkv_dim), device=device, dtype=torch.bfloat16)
         )
+        self._use_fp8 = os.getenv("ATTN_FP8", "0").strip().lower() not in {
+            "0", "false", "no", "off",
+        }
+        self._weight_fp8: torch.Tensor | None = None
+        self._weight_scale: torch.Tensor | None = None
 
     @record_function("qkv_linear")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -152,6 +157,14 @@ class QKV(torch.nn.Module):
         q, k, v = torch.split(qkv, (q_dim, kv_dim, kv_dim), dim=-1)
         return q.contiguous(), k.contiguous(), v.contiguous()
 
+    @property
+    def _fp8_weight(self):
+        if not self._use_fp8:
+            return None, None
+        if self._weight_fp8 is None:
+            self._weight_fp8, self._weight_scale = _quantize_unembed_fp8(self.weight)
+        return self._weight_fp8, self._weight_scale
+
 
 class OUT(torch.nn.Module):
     def __init__(
@@ -164,6 +177,19 @@ class OUT(torch.nn.Module):
         self.bias = torch.nn.Parameter(
             torch.empty((hidden_size), device=device, dtype=torch.bfloat16)
         )
+        self._use_fp8 = os.getenv("ATTN_FP8", "0").strip().lower() not in {
+            "0", "false", "no", "off",
+        }
+        self._weight_fp8: torch.Tensor | None = None
+        self._weight_scale: torch.Tensor | None = None
+
+    @property
+    def _fp8_weight(self):
+        if not self._use_fp8:
+            return None, None
+        if self._weight_fp8 is None:
+            self._weight_fp8, self._weight_scale = _quantize_unembed_fp8(self.weight)
+        return self._weight_fp8, self._weight_scale
 
     @record_function("out_linear")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -181,6 +207,9 @@ class OUT(torch.nn.Module):
             and residual.shape == (x.shape[0], 1, self.weight.shape[0])
             and residual.dtype == torch.bfloat16
         ):
+            if self._use_fp8:
+                w_fp8, w_scale = self._fp8_weight
+                return out_residual_decode_forward(x, w_fp8, self.bias, residual, weight_scale=w_scale)
             return out_residual_decode_forward(x, self.weight, self.bias, residual)
         return self.forward(x) + residual
 
@@ -455,9 +484,10 @@ class AttentionBlock(torch.nn.Module):
             ):
                 fused_decode = True
                 offset = cache.offset.clone()
+                qkv_w, qkv_ws = self.qkv._fp8_weight
                 q = qkv_rope_cache_decode_forward(
                     t,
-                    self.qkv.weight,
+                    qkv_w if qkv_ws is not None else self.qkv.weight,
                     self.qkv.bias,
                     self.rope.sin,
                     self.rope.cos,
@@ -468,6 +498,7 @@ class AttentionBlock(torch.nn.Module):
                     self.num_attention_heads,
                     self.num_key_value_heads,
                     self.head_dim,
+                    weight_scale=qkv_ws,
                 )
                 cache.offset.add_(1)
             else:
