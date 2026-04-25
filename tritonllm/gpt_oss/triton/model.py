@@ -27,6 +27,8 @@ from gpt_oss.triton.triton_kernels import (
     rope_forward,
     unembedding_decode_forward,
     unembedding_decode_fp8_forward,
+    unembedding_decode_argmax_forward,
+    unembedding_decode_fp8_argmax_forward,
     _quantize_unembed_fp8,
 )
 
@@ -94,6 +96,23 @@ class UnEmbedding(torch.nn.Module):
                 return unembedding_decode_fp8_forward(x, self._weight_fp8, self._weight_scale)
             return unembedding_decode_forward(x, self.weight)
         return torch.nn.functional.linear(x, self.weight, bias=None)
+
+    @record_function("unembedding_argmax")
+    def forward_argmax(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            x.is_cuda
+            and x.ndim == 3
+            and x.shape[1] == 1
+            and x.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+        ):
+            if self._use_fp8:
+                if self._weight_fp8 is None:
+                    self._weight_fp8, self._weight_scale = _quantize_unembed_fp8(self.weight)
+                return unembedding_decode_fp8_argmax_forward(x, self._weight_fp8, self._weight_scale)
+            return unembedding_decode_argmax_forward(x, self.weight)
+        logits = self.forward(x)
+        return logits[-1].argmax(dim=-1)
 
 
 class QKV(torch.nn.Module):
@@ -780,6 +799,12 @@ class Transformer(torch.nn.Module):
         x = self.unembedding(x)
         return x.float()
 
+    @record_function("forward_greedy")
+    def forward_greedy(self, x: torch.Tensor, caches: list[Cache] | None = None) -> torch.Tensor:
+        """Fused forward that returns token IDs instead of logits (for greedy T=0)."""
+        x = self._forward_hidden(x, caches)
+        return self.unembedding.forward_argmax(x)
+
     def prefill(self, x: torch.Tensor, caches):
         """Populate KV cache for the prompt without paying vocab projection cost."""
         return self._forward_hidden(x, caches)
@@ -856,13 +881,17 @@ class TokenGenerator:
         self.input_token = torch.zeros(1, dtype=torch.int32, device=self.device)
         # warmup
         self.model(self.input_token[None, :], caches=self.caches)
+        self._sampling_graph = None
+        self._greedy_graph = None
+        self._greedy_token: torch.Tensor | None = None
         if self.use_cuda_graph:
-            # capture for sampling
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
+            self._sampling_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._sampling_graph):
                 self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
+            self._greedy_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._greedy_graph):
+                self._greedy_token = self.model.forward_greedy(self.input_token[None, :], caches=self.caches)
         else:
-            self.graph = None
             self.logits = None
             print(termcolor.colored("CUDA Graph disabled, using eager mode", "yellow"), flush=True)
         self._sampling_probs = torch.empty(self.model.config.vocab_size, device=self.device, dtype=torch.bfloat16)
@@ -997,11 +1026,16 @@ class TokenGenerator:
                     if not can_continue:
                         return
                     self.input_token[0] = predicted_token
-                    if self.use_cuda_graph:
-                        self.graph.replay()
+                    if self.use_cuda_graph and self._greedy_graph is not None and temperature == 0.0:
+                        self._greedy_graph.replay()
+                    elif self.use_cuda_graph:
+                        self._sampling_graph.replay()
                     else:
                         self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
-                    self.sample_next_token(self.logits, temperature)
+                    if temperature == 0.0:
+                        self.logits.argmax()
+                    else:
+                        self.sample_next_token(self.logits, temperature)
             self.last_generation_stats = {
                 "generated_tokens": 0,
                 "prefill_time_s": prefill_elapsed,
@@ -1012,16 +1046,24 @@ class TokenGenerator:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         decode_start = time.perf_counter()
+        use_fused_greedy = temperature == 0.0 and not return_logprobs
         while max_tokens == 0 or num_generated_tokens < max_tokens:
             can_continue, decode_offset = self._handle_kv_capacity(decode_offset)
             if not can_continue:
                 break
             self.input_token[0] = predicted_token
-            if self.use_cuda_graph:
-                self.graph.replay()
+            if use_fused_greedy:
+                if self.use_cuda_graph:
+                    self._greedy_graph.replay()
+                    predicted_token = self._greedy_token.item()
+                else:
+                    predicted_token = self.model.forward_greedy(self.input_token[None, :], caches=self.caches).item()
             else:
-                self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
-            predicted_token = self.sample_next_token(self.logits, temperature)
+                if self.use_cuda_graph:
+                    self._sampling_graph.replay()
+                else:
+                    self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
+                predicted_token = self.sample_next_token(self.logits, temperature)
             decode_offset += 1
             num_generated_tokens += 1
 

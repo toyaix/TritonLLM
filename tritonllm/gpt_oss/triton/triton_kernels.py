@@ -247,7 +247,7 @@ def unembedding_decode_fp8_kernel(
             + offs_vocab[:, None].to(tl.int64) * stride_weight_vocab
             + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
             mask=(offs_vocab[:, None] < vocab_size) & (k_offsets[None, :] < hidden_size),
-            other=0,
+            other=0.0,
         )
         acc += tl.sum(weight_tile * hidden[None, :] * scales[:, None], axis=1)
 
@@ -279,7 +279,7 @@ def unembedding_decode_fp8_forward(hidden, weight_fp8, weight_scale):
         hidden = hidden.contiguous()
 
     logits = _pool_get((batch, vocab_size), hidden.dtype, hidden.device)
-    grid = lambda META: (triton.cdiv(vocab_size, META["BLOCK_V"]), batch)
+    grid = (triton.cdiv(vocab_size, 128), batch)
     unembedding_decode_fp8_kernel[grid](
         hidden,
         weight_fp8,
@@ -294,8 +294,218 @@ def unembedding_decode_fp8_forward(hidden, weight_fp8, weight_scale):
         weight_scale.stride(0),
         logits.stride(0),
         logits.stride(1),
+        BLOCK_V=128,
+        BLOCK_K=256,
+        num_warps=4,
+        num_stages=2,
     )
     return logits[:, None, :]
+
+
+@triton.jit
+def unembedding_decode_argmax_kernel(
+    hidden_ptr,
+    weight_ptr,
+    partial_max_ptr,
+    partial_idx_ptr,
+    vocab_size,
+    hidden_size,
+    stride_hidden_batch,
+    stride_hidden_dim,
+    stride_weight_vocab,
+    stride_weight_dim,
+    stride_partial_tile,
+    stride_partial_batch,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Like unembedding_decode_kernel but writes per-tile (max_val, argmax_idx) instead of logits."""
+    pid_vocab = tl.program_id(0)
+    pid_batch = tl.program_id(1)
+
+    offs_vocab = pid_vocab * BLOCK_V + tl.arange(0, BLOCK_V)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    hidden_ptr = hidden_ptr + pid_batch.to(tl.int64) * stride_hidden_batch
+
+    acc = tl.zeros((BLOCK_V,), dtype=tl.float32)
+
+    for k_start in range(0, hidden_size, BLOCK_K):
+        k_offsets = k_start + offs_k
+        hidden = tl.load(
+            hidden_ptr + k_offsets.to(tl.int64) * stride_hidden_dim,
+            mask=k_offsets < hidden_size,
+            other=0,
+        )
+        weight = tl.load(
+            weight_ptr
+            + offs_vocab[:, None].to(tl.int64) * stride_weight_vocab
+            + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
+            mask=(offs_vocab[:, None] < vocab_size) & (k_offsets[None, :] < hidden_size),
+            other=0,
+        )
+        acc += tl.sum(weight * hidden[None, :], axis=1)
+
+    acc = tl.where(offs_vocab < vocab_size, acc, -1.0e30)
+    local_max, local_argmax = tl.max(acc, axis=0, return_indices=True)
+    local_argmax = local_argmax + pid_vocab * BLOCK_V
+
+    tl.store(
+        partial_max_ptr + pid_vocab.to(tl.int64) * stride_partial_tile + pid_batch.to(tl.int64) * stride_partial_batch,
+        local_max,
+    )
+    tl.store(
+        partial_idx_ptr + pid_vocab.to(tl.int64) * stride_partial_tile + pid_batch.to(tl.int64) * stride_partial_batch,
+        local_argmax,
+    )
+
+
+def unembedding_decode_argmax_forward(hidden, weight):
+    batch, num_tokens, hidden_size = hidden.shape
+    vocab_size, hidden_size_weight = weight.shape
+    assert num_tokens == 1
+    assert hidden_size == hidden_size_weight
+
+    hidden = hidden.reshape(batch, hidden_size)
+    if hidden.stride(-1) != 1:
+        hidden = hidden.contiguous()
+    if weight.stride(-1) != 1:
+        weight = weight.contiguous()
+
+    num_tiles = triton.cdiv(vocab_size, 128)
+    partial_max = _pool_get((num_tiles, batch), torch.float32, hidden.device)
+    partial_idx = _pool_get((num_tiles, batch), torch.int32, hidden.device)
+
+    grid = lambda META: (num_tiles, batch)
+    unembedding_decode_argmax_kernel[grid](
+        hidden,
+        weight,
+        partial_max,
+        partial_idx,
+        vocab_size,
+        hidden_size,
+        hidden.stride(0),
+        hidden.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        partial_max.stride(0),
+        partial_max.stride(1),
+        BLOCK_V=128,
+        BLOCK_K=256,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    best_tiles = partial_max.argmax(dim=0)
+    token_ids = partial_idx[best_tiles, torch.arange(batch, device=hidden.device)]
+    return token_ids
+
+
+@triton.jit
+def unembedding_decode_fp8_argmax_kernel(
+    hidden_ptr,
+    weight_fp8_ptr,
+    weight_scale_ptr,
+    partial_max_ptr,
+    partial_idx_ptr,
+    vocab_size,
+    hidden_size,
+    stride_hidden_batch,
+    stride_hidden_dim,
+    stride_weight_vocab,
+    stride_weight_dim,
+    stride_scale,
+    stride_partial_tile,
+    stride_partial_batch,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """FP8 variant of unembedding_decode_argmax_kernel."""
+    pid_vocab = tl.program_id(0)
+    pid_batch = tl.program_id(1)
+
+    offs_vocab = pid_vocab * BLOCK_V + tl.arange(0, BLOCK_V)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    hidden_ptr = hidden_ptr + pid_batch.to(tl.int64) * stride_hidden_batch
+
+    scales = tl.load(
+        weight_scale_ptr + offs_vocab.to(tl.int64) * stride_scale,
+        mask=offs_vocab < vocab_size,
+        other=1.0,
+    )
+
+    acc = tl.zeros((BLOCK_V,), dtype=tl.float32)
+
+    for k_start in range(0, hidden_size, BLOCK_K):
+        k_offsets = k_start + offs_k
+        hidden = tl.load(
+            hidden_ptr + k_offsets.to(tl.int64) * stride_hidden_dim,
+            mask=k_offsets < hidden_size,
+            other=0,
+        )
+        weight_tile = tl.load(
+            weight_fp8_ptr
+            + offs_vocab[:, None].to(tl.int64) * stride_weight_vocab
+            + k_offsets[None, :].to(tl.int64) * stride_weight_dim,
+            mask=(offs_vocab[:, None] < vocab_size) & (k_offsets[None, :] < hidden_size),
+            other=0.0,
+        )
+        acc += tl.sum(weight_tile * hidden[None, :] * scales[:, None], axis=1)
+
+    acc = tl.where(offs_vocab < vocab_size, acc, -1.0e30)
+    local_max, local_argmax = tl.max(acc, axis=0, return_indices=True)
+    local_argmax = local_argmax + pid_vocab * BLOCK_V
+
+    tl.store(
+        partial_max_ptr + pid_vocab.to(tl.int64) * stride_partial_tile + pid_batch.to(tl.int64) * stride_partial_batch,
+        local_max,
+    )
+    tl.store(
+        partial_idx_ptr + pid_vocab.to(tl.int64) * stride_partial_tile + pid_batch.to(tl.int64) * stride_partial_batch,
+        local_argmax,
+    )
+
+
+def unembedding_decode_fp8_argmax_forward(hidden, weight_fp8, weight_scale):
+    batch, num_tokens, hidden_size = hidden.shape
+    vocab_size, hidden_size_weight = weight_fp8.shape
+    assert num_tokens == 1
+    assert hidden_size == hidden_size_weight
+
+    hidden = hidden.reshape(batch, hidden_size)
+    if hidden.stride(-1) != 1:
+        hidden = hidden.contiguous()
+
+    num_tiles = triton.cdiv(vocab_size, 128)
+    partial_max = _pool_get((num_tiles, batch), torch.float32, hidden.device)
+    partial_idx = _pool_get((num_tiles, batch), torch.int32, hidden.device)
+
+    grid = lambda META: (num_tiles, batch)
+    unembedding_decode_fp8_argmax_kernel[grid](
+        hidden,
+        weight_fp8,
+        weight_scale,
+        partial_max,
+        partial_idx,
+        vocab_size,
+        hidden_size,
+        hidden.stride(0),
+        hidden.stride(1),
+        weight_fp8.stride(0),
+        weight_fp8.stride(1),
+        weight_scale.stride(0),
+        partial_max.stride(0),
+        partial_max.stride(1),
+        BLOCK_V=128,
+        BLOCK_K=256,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    best_tiles = partial_max.argmax(dim=0)
+    token_ids = partial_idx[best_tiles, torch.arange(batch, device=hidden.device)]
+    return token_ids
 
 
 def unembedding_forward(hidden, weight):
