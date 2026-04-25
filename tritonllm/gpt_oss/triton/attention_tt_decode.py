@@ -3,6 +3,8 @@ import torch
 import triton
 import triton.language as tl
 
+from gpt_oss.triton.scratch_pool import get as _pool_get
+
 
 @triton.jit
 def _attn_decode_fwd(
@@ -302,9 +304,9 @@ class _attention_decode(torch.autograd.Function):
         q = q[:, 0, :, :, :].contiguous()
         k = k.contiguous()
         v = v.contiguous()
-        o = torch.empty_like(q)
+        o = _pool_get(tuple(q.shape), q.dtype, q.device)
 
-        BLOCK_N = 64
+        BLOCK_N = 128
         # Use split-K for long KV sequences to parallelize across SMs
         if n_kv_ctx <= 1024:
             SPLIT_K = 1

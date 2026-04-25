@@ -26,6 +26,10 @@ from gpt_oss.triton.triton_kernels import (
     rmsnorm_forward,
     rope_forward,
     unembedding_decode_forward,
+    unembedding_decode_fp8_forward,
+    unembedding_decode_argmax_forward,
+    unembedding_decode_fp8_argmax_forward,
+    _quantize_unembed_fp8,
 )
 
 @dataclass
@@ -59,8 +63,8 @@ class RMSNorm(torch.nn.Module):
         )
 
     @record_function("rmsnorm_triton")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return rmsnorm_forward(x, self.scale, self.eps)
+    def forward(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        return rmsnorm_forward(x, self.scale, self.eps, out=out)
 
 
 class UnEmbedding(torch.nn.Module):
@@ -71,6 +75,11 @@ class UnEmbedding(torch.nn.Module):
         self.weight = torch.nn.Parameter(
             torch.empty((vocab_size, hidden_size), device=device, dtype=torch.bfloat16)
         )
+        self._use_fp8 = os.getenv("UNEMBED_FP8", "0").strip().lower() not in {
+            "0", "false", "no", "off",
+        }
+        self._weight_fp8: torch.Tensor | None = None
+        self._weight_scale: torch.Tensor | None = None
 
     @record_function("unembedding_linear")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -81,8 +90,29 @@ class UnEmbedding(torch.nn.Module):
             and x.dtype == torch.bfloat16
             and self.weight.dtype == torch.bfloat16
         ):
+            if self._use_fp8:
+                if self._weight_fp8 is None:
+                    self._weight_fp8, self._weight_scale = _quantize_unembed_fp8(self.weight)
+                return unembedding_decode_fp8_forward(x, self._weight_fp8, self._weight_scale)
             return unembedding_decode_forward(x, self.weight)
         return torch.nn.functional.linear(x, self.weight, bias=None)
+
+    @record_function("unembedding_argmax")
+    def forward_argmax(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            x.is_cuda
+            and x.ndim == 3
+            and x.shape[1] == 1
+            and x.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+        ):
+            if self._use_fp8:
+                if self._weight_fp8 is None:
+                    self._weight_fp8, self._weight_scale = _quantize_unembed_fp8(self.weight)
+                return unembedding_decode_fp8_argmax_forward(x, self._weight_fp8, self._weight_scale)
+            return unembedding_decode_argmax_forward(x, self.weight)
+        logits = self.forward(x)
+        return logits[-1].argmax(dim=-1)
 
 
 class QKV(torch.nn.Module):
@@ -96,6 +126,11 @@ class QKV(torch.nn.Module):
         self.bias = torch.nn.Parameter(
             torch.empty((qkv_dim), device=device, dtype=torch.bfloat16)
         )
+        self._use_fp8 = os.getenv("ATTN_FP8", "0").strip().lower() not in {
+            "0", "false", "no", "off",
+        }
+        self._weight_fp8: torch.Tensor | None = None
+        self._weight_scale: torch.Tensor | None = None
 
     @record_function("qkv_linear")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -122,6 +157,14 @@ class QKV(torch.nn.Module):
         q, k, v = torch.split(qkv, (q_dim, kv_dim, kv_dim), dim=-1)
         return q.contiguous(), k.contiguous(), v.contiguous()
 
+    @property
+    def _fp8_weight(self):
+        if not self._use_fp8:
+            return None, None
+        if self._weight_fp8 is None:
+            self._weight_fp8, self._weight_scale = _quantize_unembed_fp8(self.weight)
+        return self._weight_fp8, self._weight_scale
+
 
 class OUT(torch.nn.Module):
     def __init__(
@@ -134,6 +177,19 @@ class OUT(torch.nn.Module):
         self.bias = torch.nn.Parameter(
             torch.empty((hidden_size), device=device, dtype=torch.bfloat16)
         )
+        self._use_fp8 = os.getenv("ATTN_FP8", "0").strip().lower() not in {
+            "0", "false", "no", "off",
+        }
+        self._weight_fp8: torch.Tensor | None = None
+        self._weight_scale: torch.Tensor | None = None
+
+    @property
+    def _fp8_weight(self):
+        if not self._use_fp8:
+            return None, None
+        if self._weight_fp8 is None:
+            self._weight_fp8, self._weight_scale = _quantize_unembed_fp8(self.weight)
+        return self._weight_fp8, self._weight_scale
 
     @record_function("out_linear")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -151,6 +207,9 @@ class OUT(torch.nn.Module):
             and residual.shape == (x.shape[0], 1, self.weight.shape[0])
             and residual.dtype == torch.bfloat16
         ):
+            if self._use_fp8:
+                w_fp8, w_scale = self._fp8_weight
+                return out_residual_decode_forward(x, w_fp8, self.bias, residual, weight_scale=w_scale)
             return out_residual_decode_forward(x, self.weight, self.bias, residual)
         return self.forward(x) + residual
 
@@ -425,9 +484,10 @@ class AttentionBlock(torch.nn.Module):
             ):
                 fused_decode = True
                 offset = cache.offset.clone()
+                qkv_w, qkv_ws = self.qkv._fp8_weight
                 q = qkv_rope_cache_decode_forward(
                     t,
-                    self.qkv.weight,
+                    qkv_w if qkv_ws is not None else self.qkv.weight,
                     self.qkv.bias,
                     self.rope.sin,
                     self.rope.cos,
@@ -438,6 +498,7 @@ class AttentionBlock(torch.nn.Module):
                     self.num_attention_heads,
                     self.num_key_value_heads,
                     self.head_dim,
+                    weight_scale=qkv_ws,
                 )
                 cache.offset.add_(1)
             else:
@@ -715,7 +776,8 @@ class MLPBlock(torch.nn.Module):
             )
         t = t.view(batch_size, n_ctx, dim)
 
-        return x + t
+        x.add_(t)
+        return x
 
 
 class TransformerBlock(torch.nn.Module):
@@ -761,12 +823,18 @@ class Transformer(torch.nn.Module):
         x = self.embedding(x)
         for block, cache in zip(self.block, caches):
             x = block(x, cache=cache)
-        return self.norm(x)
+        return self.norm(x, out=x)
 
     def forward(self, x: torch.Tensor, caches: list[Cache] | None = None) -> torch.Tensor:
         x = self._forward_hidden(x, caches)
         x = self.unembedding(x)
         return x.float()
+
+    @record_function("forward_greedy")
+    def forward_greedy(self, x: torch.Tensor, caches: list[Cache] | None = None) -> torch.Tensor:
+        """Fused forward that returns token IDs instead of logits (for greedy T=0)."""
+        x = self._forward_hidden(x, caches)
+        return self.unembedding.forward_argmax(x)
 
     def prefill(self, x: torch.Tensor, caches):
         """Populate KV cache for the prompt without paying vocab projection cost."""
@@ -844,13 +912,17 @@ class TokenGenerator:
         self.input_token = torch.zeros(1, dtype=torch.int32, device=self.device)
         # warmup
         self.model(self.input_token[None, :], caches=self.caches)
+        self._sampling_graph = None
+        self._greedy_graph = None
+        self._greedy_token: torch.Tensor | None = None
         if self.use_cuda_graph:
-            # capture for sampling
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
+            self._sampling_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._sampling_graph):
                 self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
+            self._greedy_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._greedy_graph):
+                self._greedy_token = self.model.forward_greedy(self.input_token[None, :], caches=self.caches)
         else:
-            self.graph = None
             self.logits = None
             print(termcolor.colored("CUDA Graph disabled, using eager mode", "yellow"), flush=True)
         self._sampling_probs = torch.empty(self.model.config.vocab_size, device=self.device, dtype=torch.bfloat16)
@@ -985,11 +1057,16 @@ class TokenGenerator:
                     if not can_continue:
                         return
                     self.input_token[0] = predicted_token
-                    if self.use_cuda_graph:
-                        self.graph.replay()
+                    if self.use_cuda_graph and self._greedy_graph is not None and temperature == 0.0:
+                        self._greedy_graph.replay()
+                    elif self.use_cuda_graph:
+                        self._sampling_graph.replay()
                     else:
                         self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
-                    self.sample_next_token(self.logits, temperature)
+                    if temperature == 0.0:
+                        self.logits.argmax()
+                    else:
+                        self.sample_next_token(self.logits, temperature)
             self.last_generation_stats = {
                 "generated_tokens": 0,
                 "prefill_time_s": prefill_elapsed,
@@ -1000,16 +1077,24 @@ class TokenGenerator:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         decode_start = time.perf_counter()
+        use_fused_greedy = temperature == 0.0 and not return_logprobs
         while max_tokens == 0 or num_generated_tokens < max_tokens:
             can_continue, decode_offset = self._handle_kv_capacity(decode_offset)
             if not can_continue:
                 break
             self.input_token[0] = predicted_token
-            if self.use_cuda_graph:
-                self.graph.replay()
+            if use_fused_greedy:
+                if self.use_cuda_graph:
+                    self._greedy_graph.replay()
+                    predicted_token = self._greedy_token.item()
+                else:
+                    predicted_token = self.model.forward_greedy(self.input_token[None, :], caches=self.caches).item()
             else:
-                self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
-            predicted_token = self.sample_next_token(self.logits, temperature)
+                if self.use_cuda_graph:
+                    self._sampling_graph.replay()
+                else:
+                    self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
+                predicted_token = self.sample_next_token(self.logits, temperature)
             decode_offset += 1
             num_generated_tokens += 1
 

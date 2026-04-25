@@ -109,11 +109,24 @@ def get_lock(model_name_or_path: Union[str, Path],
     return lock
 
 
+def _get_modelscope_cache_dir():
+    return os.environ.get("MODELSCOPE_CACHE", os.path.join(os.path.expanduser("~"), ".cache", "modelscope"))
+
+
 def get_model(size_str) -> str:
-    from modelscope import snapshot_download
     pretrained_model_name_or_path = f"openai-mirror/gpt-oss-{size_str}"
-    # Use file lock to prevent multiple processes from
-    # downloading the same model weights at the same time.
+    # Check cache first to avoid snapshot_download overhead when model is already
+    # cached (snapshot_download takes ~2.4s even on cache hit).
+    cache_dir = os.path.join(
+        _get_modelscope_cache_dir(), "models", *pretrained_model_name_or_path.split("/"), "original"
+    )
+    if os.path.isdir(cache_dir) and any(
+        f.endswith(".safetensors") for f in os.listdir(cache_dir)
+        if os.path.isfile(os.path.join(cache_dir, f))
+    ):
+        return cache_dir
+
+    from modelscope import snapshot_download
     with get_lock(pretrained_model_name_or_path):
         model_path = snapshot_download(
             model_id=pretrained_model_name_or_path,
