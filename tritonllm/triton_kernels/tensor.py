@@ -213,6 +213,34 @@ def wrap_torch_tensor(torch_tensor, dtype=None):
     return Tensor(Storage(torch_tensor), dtype=dtype, shape=shape)
 
 
+def expert_slice(tensor: Tensor, index: int) -> Tensor:
+    """Return a new Tensor for a single expert slice along dim 0.
+
+    The swizzle treats dim 0 as a batch dimension, so slicing the
+    swizzled storage.data directly produces a valid single-expert weight.
+    """
+    assert isinstance(tensor, Tensor), f"Expected Tensor, got {type(tensor)}"
+    assert tensor.ndim >= 3, f"Tensor must have expert dim, got shape {tensor.shape}"
+    assert 0 <= index < tensor.shape[0], f"Expert index {index} out of range [0, {tensor.shape[0]})"
+
+    raw = tensor.storage.data
+    old_layout = tensor.storage.layout
+    new_shape = [1] + list(tensor.shape[1:])
+
+    layout_cls = type(old_layout)
+    layout_kwargs = {}
+    for field_name in ['mx_axis', 'mma_version', 'num_warps']:
+        if hasattr(old_layout, field_name):
+            layout_kwargs[field_name] = getattr(old_layout, field_name)
+    new_layout = layout_cls(tuple(new_shape), **layout_kwargs)
+
+    return Tensor(
+        Storage(raw[index:index + 1], new_layout),
+        dtype=tensor.dtype,
+        shape=new_shape,
+    )
+
+
 def convert_layout(tensor: Tensor, layout_cls: Type[Layout], **layout_kwargs):
     assert isinstance(tensor, Tensor)
     old_storage = tensor.storage
