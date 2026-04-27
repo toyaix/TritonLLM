@@ -13,7 +13,47 @@ dimension, so ``storage.data[eid]`` correctly isolates a single expert.
 
 from typing import Optional
 
+import ctypes
 import torch
+
+
+# ------------------------------------------------------------------
+# In-place CPU memory pinning via cudaHostRegister / cudaHostUnregister.
+# Temporarily pins source tensors so that ``copy_`` to GPU uses DMA,
+# then unpins immediately after.  Only 4 experts are pinned at a time.
+# ------------------------------------------------------------------
+
+_PAGE_SIZE = 4096
+
+
+def _pin_cpu(tensor: torch.Tensor) -> bool:
+    """Pin *tensor*'s memory in-place via cudaHostRegister. Returns True on success."""
+    ptr = tensor.data_ptr()
+    size = tensor.numel() * tensor.element_size()
+    aligned_ptr = ptr & ~(_PAGE_SIZE - 1)
+    offset = ptr - aligned_ptr
+    aligned_size = size + offset
+    try:
+        cuda = torch.cuda.cudart()
+        cuda.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+        cuda.cudaHostRegister.restype = ctypes.c_int
+        err = cuda.cudaHostRegister(ctypes.c_void_p(aligned_ptr), aligned_size, 0)
+        return err == 0
+    except Exception:
+        return False
+
+
+def _unpin_cpu(tensor: torch.Tensor) -> None:
+    """Unpin memory previously pinned with _pin_cpu."""
+    ptr = tensor.data_ptr()
+    aligned_ptr = ptr & ~(_PAGE_SIZE - 1)
+    try:
+        cuda = torch.cuda.cudart()
+        cuda.cudaHostUnregister.argtypes = [ctypes.c_void_p]
+        cuda.cudaHostUnregister.restype = ctypes.c_int
+        cuda.cudaHostUnregister(ctypes.c_void_p(aligned_ptr))
+    except Exception:
+        pass
 
 
 class ExpertCache:
@@ -139,7 +179,12 @@ class ExpertCache:
     # ------------------------------------------------------------------
 
     def ensure_experts(self, layer_idx: int, expert_ids: list[int]) -> None:
-        """Synchronously copy expert weights from CPU → GPU if not already present."""
+        """Synchronously copy expert weights from CPU → GPU if not already present.
+
+        Temporarily pins source CPU memory via cudaHostRegister so the
+        copy uses DMA, then unpins immediately to limit pinned-memory
+        pressure to only the active experts.
+        """
         gpu_w1_raw = self.gpu_w1.storage.data
         gpu_w2_raw = self.gpu_w2.storage.data
         gpu_w1_mx_raw = (
@@ -159,14 +204,34 @@ class ExpertCache:
             if self.gpu_layer[eid_i] == layer_idx:
                 continue
             cw = cpu_layer[eid_i]
+
+            # Pin source, copy, unpin — per tensor to keep pinned footprint tiny
+            _pin_cpu(cw["w1"])
             gpu_w1_raw[eid_i].copy_(cw["w1"])
+            _unpin_cpu(cw["w1"])
+
             if gpu_w1_mx_raw is not None and cw["w1_mx"] is not None:
+                _pin_cpu(cw["w1_mx"])
                 gpu_w1_mx_raw[eid_i].copy_(cw["w1_mx"])
+                _unpin_cpu(cw["w1_mx"])
+
+            _pin_cpu(cw["b1"])
             self.gpu_b1[eid_i].copy_(cw["b1"])
+            _unpin_cpu(cw["b1"])
+
+            _pin_cpu(cw["w2"])
             gpu_w2_raw[eid_i].copy_(cw["w2"])
+            _unpin_cpu(cw["w2"])
+
             if gpu_w2_mx_raw is not None and cw["w2_mx"] is not None:
+                _pin_cpu(cw["w2_mx"])
                 gpu_w2_mx_raw[eid_i].copy_(cw["w2_mx"])
+                _unpin_cpu(cw["w2_mx"])
+
+            _pin_cpu(cw["b2"])
             self.gpu_b2[eid_i].copy_(cw["b2"])
+            _unpin_cpu(cw["b2"])
+
             self.gpu_layer[eid_i] = layer_idx
 
     def load_all_experts(self, layer_idx: int) -> None:
