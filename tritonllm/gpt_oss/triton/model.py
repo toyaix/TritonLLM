@@ -18,7 +18,8 @@ if not cuda_capability_geq(9):
 else:
     from gpt_oss.triton.attention_tt_tma import attention
 
-from gpt_oss.triton.moe import quantize_mx4, moe, moe_decode
+from gpt_oss.triton.moe import quantize_mx4, moe, moe_decode, moe_decode_gate_routing, moe_decode_experts, moe_gate_routing, moe_experts
+from gpt_oss.triton.expert_cache import ExpertCache
 from gpt_oss.triton.triton_kernels import (
     out_residual_decode_forward,
     qkv_rope_cache_decode_forward,
@@ -578,12 +579,15 @@ class MLPBlock(torch.nn.Module):
         config: ModelConfig,
         layer_idx: int = 0,
         device: torch.device | None = None,
+        cpu_offload: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
         self.num_experts = config.num_experts
         self.experts_per_token = config.experts_per_token
         self.swiglu_limit = config.swiglu_limit
+        self._cpu_offload = cpu_offload
+        self.expert_cache: ExpertCache | None = None
         self.norm = RMSNorm(config.hidden_size, device=device)
         self.gate = torch.nn.ParameterDict({
             "weight": torch.nn.Parameter(
@@ -607,50 +611,60 @@ class MLPBlock(torch.nn.Module):
             persistent=False,
         )
         self._gate_bias_fp32_version = self._maybe_tensor_version(self.gate["bias"])
-        self.mlp1_weight_tensor, self.mlp1_weight_mx = quantize_mx4(
-            torch.empty(
-                (
-                    config.num_experts,
-                    config.hidden_size,
-                    config.intermediate_size * 2,
+        if cpu_offload:
+            self.mlp1_weight_tensor = torch.empty(1, device=device)
+            self.mlp1_weight_mx = torch.empty(1, device=device)
+            self.mlp1_weight = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
+            self.mlp1_bias = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
+            self.mlp2_weight_tensor = torch.empty(1, device=device)
+            self.mlp2_weight_mx = torch.empty(1, device=device)
+            self.mlp2_weight = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
+            self.mlp2_bias = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
+        else:
+            self.mlp1_weight_tensor, self.mlp1_weight_mx = quantize_mx4(
+                torch.empty(
+                    (
+                        config.num_experts,
+                        config.hidden_size,
+                        config.intermediate_size * 2,
+                    ),
+                    device=device,
+                    dtype=torch.bfloat16,
                 ),
-                device=device,
-                dtype=torch.bfloat16,
-            ),
-        )
-        self.mlp1_weight = torch.nn.Parameter(self.mlp1_weight_tensor.storage.data, requires_grad=False)
-        self.mlp1_bias = torch.nn.Parameter(
-            torch.empty(
-                (config.num_experts, config.intermediate_size * 2),
-                device=device,
-                dtype=torch.bfloat16,
             )
-        )
+            self.mlp1_weight = torch.nn.Parameter(self.mlp1_weight_tensor.storage.data, requires_grad=False)
+            self.mlp1_bias = torch.nn.Parameter(
+                torch.empty(
+                    (config.num_experts, config.intermediate_size * 2),
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+            )
+            self.mlp2_weight_tensor, self.mlp2_weight_mx = quantize_mx4(
+                torch.empty(
+                    (
+                        config.num_experts,
+                        config.intermediate_size,
+                        config.hidden_size,
+                    ),
+                    device=device,
+                    dtype=torch.bfloat16,
+                ),
+            )
+            self.mlp2_weight = torch.nn.Parameter(self.mlp2_weight_tensor.storage.data, requires_grad=False)
+            self.mlp2_bias = torch.nn.Parameter(
+                torch.empty(
+                    (config.num_experts, config.hidden_size),
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+            )
         self.register_buffer(
             "mlp1_bias_fp32_cache",
             self.mlp1_bias.detach().float().clone(),
             persistent=False,
         )
         self._mlp1_bias_fp32_version = self._maybe_tensor_version(self.mlp1_bias)
-        self.mlp2_weight_tensor, self.mlp2_weight_mx = quantize_mx4(
-            torch.empty(
-                (
-                    config.num_experts,
-                    config.intermediate_size,
-                    config.hidden_size,
-                ),
-                device=device,
-                dtype=torch.bfloat16,
-            ),
-        )
-        self.mlp2_weight = torch.nn.Parameter(self.mlp2_weight_tensor.storage.data, requires_grad=False)
-        self.mlp2_bias = torch.nn.Parameter(
-            torch.empty(
-                (config.num_experts, config.hidden_size),
-                device=device,
-                dtype=torch.bfloat16,
-            )
-        )
         self.register_buffer(
             "mlp2_bias_fp32_cache",
             self.mlp2_bias.detach().float().clone(),
@@ -739,8 +753,6 @@ class MLPBlock(torch.nn.Module):
         batch_size, n_ctx, dim = x.shape
         t = self.norm(x)
         gate_bias = self._get_gate_bias_fp32()
-        mlp1_bias = self._get_mlp1_bias_fp32()
-        mlp2_bias = self._get_mlp2_bias_fp32()
 
         t = t.view(batch_size * n_ctx, dim)
         if (
@@ -749,36 +761,80 @@ class MLPBlock(torch.nn.Module):
             and x.dtype == torch.bfloat16
             and self.gate["weight"].dtype == torch.bfloat16
         ):
-            t = moe_decode(
-                t,
-                self.gate["weight"],
-                self.mlp1_weight_tensor, self.mlp1_weight_mx,
-                self.mlp2_weight_tensor, self.mlp2_weight_mx,
-                gate_bias,
-                mlp1_bias,
-                mlp2_bias,
-                experts_per_token=self.experts_per_token,
-                num_experts=self.num_experts,
-                swiglu_limit=self.swiglu_limit,
-            )
+            if self._cpu_offload and self.expert_cache is not None:
+                t = self._forward_decode_offload(t, gate_bias)
+            else:
+                mlp1_bias = self._get_mlp1_bias_fp32()
+                mlp2_bias = self._get_mlp2_bias_fp32()
+                t = moe_decode(
+                    t,
+                    self.gate["weight"],
+                    self.mlp1_weight_tensor, self.mlp1_weight_mx,
+                    self.mlp2_weight_tensor, self.mlp2_weight_mx,
+                    gate_bias,
+                    mlp1_bias,
+                    mlp2_bias,
+                    experts_per_token=self.experts_per_token,
+                    num_experts=self.num_experts,
+                    swiglu_limit=self.swiglu_limit,
+                )
         else:
-            t = moe(
-                t,
-                self.gate["weight"],
-                self.mlp1_weight_tensor, self.mlp1_weight_mx,
-                self.mlp2_weight_tensor, self.mlp2_weight_mx,
-                gate_bias,
-                mlp1_bias,
-                mlp2_bias,
-                experts_per_token=self.experts_per_token,
-                num_experts=self.num_experts,
-                swiglu_limit=self.swiglu_limit,
-            )
+            if self._cpu_offload and self.expert_cache is not None:
+                rdata, gather_indx, scatter_indx = moe_gate_routing(
+                    t, self.gate["weight"], gate_bias,
+                    experts_per_token=self.experts_per_token,
+                )
+                if rdata is not None:
+                    expert_ids = torch.where(rdata.expt_hist > 0)[0]
+                    self.expert_cache.ensure_experts(self.layer_idx, expert_ids.tolist())
+                    t = moe_experts(
+                        t,
+                        self.expert_cache.gpu_w1, self.expert_cache.gpu_w1_mx,
+                        self.expert_cache.gpu_w2, self.expert_cache.gpu_w2_mx,
+                        self.expert_cache.gpu_b1,
+                        self.expert_cache.gpu_b2,
+                        rdata, gather_indx, scatter_indx,
+                        swiglu_limit=self.swiglu_limit,
+                    )
+            else:
+                mlp1_bias = self._get_mlp1_bias_fp32()
+                mlp2_bias = self._get_mlp2_bias_fp32()
+                t = moe(
+                    t,
+                    self.gate["weight"],
+                    self.mlp1_weight_tensor, self.mlp1_weight_mx,
+                    self.mlp2_weight_tensor, self.mlp2_weight_mx,
+                    gate_bias,
+                    mlp1_bias,
+                    mlp2_bias,
+                    experts_per_token=self.experts_per_token,
+                    num_experts=self.num_experts,
+                    swiglu_limit=self.swiglu_limit,
+                )
         t = t.view(batch_size, n_ctx, dim)
 
         x.add_(t)
         return x
 
+    def _forward_decode_offload(self, t: torch.Tensor, gate_bias: torch.Tensor) -> torch.Tensor:
+        cache = self.expert_cache
+        rdata, gather_indx, scatter_indx = moe_decode_gate_routing(
+            t, self.gate["weight"], gate_bias,
+            experts_per_token=self.experts_per_token,
+            num_experts=self.num_experts,
+        )
+        if rdata is None:
+            return t
+        expert_ids = torch.where(rdata.expt_hist > 0)[0]
+        cache.ensure_experts(self.layer_idx, expert_ids.tolist())
+        return moe_decode_experts(
+            t,
+            cache.gpu_w1, cache.gpu_w1_mx,
+            cache.gpu_w2, cache.gpu_w2_mx,
+            cache.gpu_b1, cache.gpu_b2,
+            rdata, gather_indx, scatter_indx,
+            swiglu_limit=self.swiglu_limit,
+        )
 
 class TransformerBlock(torch.nn.Module):
     def __init__(
@@ -786,11 +842,12 @@ class TransformerBlock(torch.nn.Module):
         config: ModelConfig,
         layer_idx: int,
         device: torch.device | None = None,
+        cpu_offload: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
         self.attn = AttentionBlock(config, layer_idx, device)
-        self.mlp = MLPBlock(config, layer_idx, device)
+        self.mlp = MLPBlock(config, layer_idx, device, cpu_offload=cpu_offload)
 
     def forward(self, x: torch.Tensor, cache: Cache | None = None) -> torch.Tensor:
         x = self.attn(x, cache=cache)
@@ -803,6 +860,7 @@ class Transformer(torch.nn.Module):
         self,
         config: ModelConfig,
         device: torch.device | None = None,
+        cpu_offload: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -811,7 +869,7 @@ class Transformer(torch.nn.Module):
         )
         self.block = torch.nn.ModuleList(
             [
-                TransformerBlock(config, layer_idx, device)
+                TransformerBlock(config, layer_idx, device, cpu_offload=cpu_offload)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -842,7 +900,10 @@ class Transformer(torch.nn.Module):
 
     @staticmethod
     def from_checkpoint(
-        path: str, config: ModelConfig | None = None, device: str | torch.device = "cuda",
+        path: str,
+        config: ModelConfig | None = None,
+        device: str | torch.device = "cuda",
+        cpu_offload: bool = False,
     ) -> "Transformer":
         if not isinstance(device, torch.device):
             device = torch.device(device)
@@ -853,12 +914,20 @@ class Transformer(torch.nn.Module):
                 json_config = json.load(f)
                 config = ModelConfig(**json_config)
 
-        model = Transformer(config=config, device=device)
+        model = Transformer(config=config, device=device, cpu_offload=cpu_offload)
         model.eval()
 
         checkpoint = Checkpoint(path, device)
 
-        for name, param in model.named_parameters():
+        if cpu_offload:
+            model._load_with_cpu_offload(checkpoint, config)
+        else:
+            model._load_gpu_only(checkpoint)
+
+        return model
+
+    def _load_gpu_only(self, checkpoint: Checkpoint) -> None:
+        for name, param in self.named_parameters():
             torch.cuda.empty_cache()
             loaded_tensor = checkpoint.get(name)
 
@@ -866,7 +935,7 @@ class Transformer(torch.nn.Module):
                 if "weight" in name:
                     loaded_tensor, scales = quantize_mx4(loaded_tensor.mT.contiguous())
                     _, block_index, _, _ = name.split(".")
-                    model.block[int(block_index)].mlp.mlp1_weight_mx = scales
+                    self.block[int(block_index)].mlp.mlp1_weight_mx = scales
                     with torch.no_grad():
                         param.copy_(loaded_tensor.storage.data)
                 else:
@@ -876,7 +945,7 @@ class Transformer(torch.nn.Module):
             elif "mlp2_weight" in name:
                 loaded_tensor, scales = quantize_mx4(loaded_tensor.mT.contiguous())
                 _, block_index, _, _ = name.split(".")
-                model.block[int(block_index)].mlp.mlp2_weight_mx = scales
+                self.block[int(block_index)].mlp.mlp2_weight_mx = scales
                 with torch.no_grad():
                     param.copy_(loaded_tensor.storage.data)
 
@@ -889,29 +958,168 @@ class Transformer(torch.nn.Module):
                 with torch.no_grad():
                     param.copy_(loaded_tensor)
 
-        for block in model.block:
+        for block in self.block:
             block.mlp.refresh_fp32_bias_caches()
 
-        # NOTE: Required to avoid OOM errors
         torch.cuda.empty_cache()
-        return model
+
+    def _load_with_cpu_offload(self, checkpoint: Checkpoint, config: ModelConfig) -> None:
+        device = torch.device("cuda")
+        cache = ExpertCache(
+            num_experts=config.num_experts,
+            experts_per_token=config.experts_per_token,
+            device=device,
+        )
+
+        # Phase 1: load non-MLP params normally (small, stay on GPU)
+        for name, param in self.named_parameters():
+            if "mlp1" in name or "mlp2" in name:
+                continue
+            torch.cuda.empty_cache()
+            loaded_tensor = checkpoint.get(name)
+            if "gate" in name and loaded_tensor.ndim == 2:
+                loaded_tensor = loaded_tensor.mT.contiguous()
+            with torch.no_grad():
+                param.copy_(loaded_tensor)
+            del loaded_tensor
+
+        _after_p1 = torch.cuda.memory_stats().get('allocated_bytes.all.current', 0)
+        print(f"GPU after Phase 1: {_after_p1/1e9:.2f} GB")
+
+        # Offload large non-MLP tensors to CPU to free GPU memory for quantization
+        # Embedding + UnEmbedding (~2.32 GB) + 36 layers attention QKV+OUT (~1.9 GB)
+        _cpu_offload_tensors: dict[str, torch.Tensor] = {}
+
+        def _move_to_cpu(model, attr_path):
+            obj = model
+            for part in attr_path.split(".")[:-1]:
+                obj = getattr(obj, part)
+            attr = attr_path.split(".")[-1]
+            param = getattr(obj, attr)
+            cpu_copy = param.data.cpu()
+            _cpu_offload_tensors[attr_path] = cpu_copy
+            param.data = torch.empty(1, device=device, dtype=param.dtype)
+
+        _move_to_cpu(self, "embedding.weight")
+        _move_to_cpu(self, "unembedding.weight")
+        for i in range(config.num_hidden_layers):
+            _move_to_cpu(self, f"block.{i}.attn.qkv.weight")
+            _move_to_cpu(self, f"block.{i}.attn.qkv.bias")
+            _move_to_cpu(self, f"block.{i}.attn.out.weight")
+            _move_to_cpu(self, f"block.{i}.attn.out.bias")
+        torch.cuda.empty_cache()
+
+        _after_offload = torch.cuda.memory_stats().get('allocated_bytes.all.current', 0)
+        print(f"GPU after offload: {_after_offload/1e9:.2f} GB")
+
+        # Phase 2: load MLP expert weights layer-by-layer
+        for block_idx, block in enumerate(self.block):
+            mlp = block.mlp
+
+            # mlp1_weight
+            loaded = checkpoint.get(f"block.{block_idx}.mlp.mlp1_weight")
+            torch.cuda.empty_cache()
+            loaded_t = loaded.mT.contiguous()
+            del loaded
+            w1, w1_mx = quantize_mx4(loaded_t)
+            del loaded_t
+            mlp.mlp1_weight_tensor = w1
+            mlp.mlp1_weight_mx = w1_mx
+            mlp.mlp1_weight = torch.nn.Parameter(w1.storage.data, requires_grad=False)
+
+            # mlp1_bias
+            loaded = checkpoint.get(f"block.{block_idx}.mlp.mlp1_bias")
+            mlp.mlp1_bias = torch.nn.Parameter(loaded, requires_grad=False)
+            del loaded
+
+            # mlp2_weight
+            loaded = checkpoint.get(f"block.{block_idx}.mlp.mlp2_weight")
+            torch.cuda.empty_cache()
+            loaded_t = loaded.mT.contiguous()
+            del loaded
+            w2, w2_mx = quantize_mx4(loaded_t)
+            del loaded_t
+            mlp.mlp2_weight_tensor = w2
+            mlp.mlp2_weight_mx = w2_mx
+            mlp.mlp2_weight = torch.nn.Parameter(w2.storage.data, requires_grad=False)
+
+            # mlp2_bias
+            loaded = checkpoint.get(f"block.{block_idx}.mlp.mlp2_bias")
+            mlp.mlp2_bias = torch.nn.Parameter(loaded, requires_grad=False)
+            del loaded
+
+            mlp.refresh_fp32_bias_caches()
+
+            cache.register_layer(
+                block_idx,
+                w1, w1_mx, mlp.mlp1_bias,
+                w2, w2_mx, mlp.mlp2_bias,
+            )
+            mlp._cpu_offload = True
+            mlp.expert_cache = cache
+
+            # Free GPU expert tensors for this layer
+            mlp.mlp1_weight_tensor = torch.empty(1, device=device)
+            mlp.mlp1_weight_mx = torch.empty(1, device=device)
+            mlp.mlp2_weight_tensor = torch.empty(1, device=device)
+            mlp.mlp2_weight_mx = torch.empty(1, device=device)
+            mlp.mlp1_weight = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
+            mlp.mlp1_bias = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
+            mlp.mlp2_bias = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
+
+            torch.cuda.empty_cache()
+
+        # Restore offloaded tensors to GPU
+        def _restore_to_gpu(model, attr_path):
+            obj = model
+            for part in attr_path.split(".")[:-1]:
+                obj = getattr(obj, part)
+            attr = attr_path.split(".")[-1]
+            cpu_copy = _cpu_offload_tensors[attr_path]
+            getattr(obj, attr).data = cpu_copy.to(device)
+
+        for attr_path in _cpu_offload_tensors:
+            _restore_to_gpu(self, attr_path)
+        _cpu_offload_tensors.clear()
+        torch.cuda.empty_cache()
+
+        _final = torch.cuda.memory_stats().get('allocated_bytes.all.current', 0)
+        print(f"GPU after Phase 2 + restore: {_final/1e9:.2f} GB")
 
 
 class TokenGenerator:
     @torch.inference_mode()
-    def __init__(self, checkpoint: str, context: int, device: torch.device):
+    def __init__(self, checkpoint: str, context: int, device: torch.device, cpu_offload: bool | None = None):
         self.device = device
-        self.use_cuda_graph = os.getenv("CUDA_GRAPH", "1").strip().lower() not in {"0", "false", "no", "off"}
+        if cpu_offload is None:
+            cpu_offload_env = os.getenv("CPU_OFFLOAD", "0").strip().lower()
+            cpu_offload = cpu_offload_env not in {"0", "false", "no", "off", ""}
+        self.cpu_offload = cpu_offload
+        self.use_cuda_graph = (
+            os.getenv("CUDA_GRAPH", "1").strip().lower() not in {"0", "false", "no", "off"}
+        )
+        if self.use_cuda_graph and self.cpu_offload:
+            print("CPU offload is incompatible with CUDA Graph; disabling CUDA Graph", flush=True)
+            self.use_cuda_graph = False
         print(termcolor.colored("Loading model checkpoint...", "yellow"), flush=True)
-        self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
+        if self.cpu_offload:
+            print(termcolor.colored("CPU_OFFLOAD enabled: MoE expert weights on CPU, attention on GPU", "yellow"), flush=True)
+        self.model = Transformer.from_checkpoint(
+            checkpoint, device=self.device, cpu_offload=self.cpu_offload,
+        )
         self.caches = [Cache(1, context, self.model.config.num_key_value_heads, device=self.device) for _ in range(len(self.model.block))]
         self.enable_dense_cache_sliding = all(cache.can_slide() for cache in self.caches)
         repeat_stop_env = os.getenv("DENSE_REPEAT_PATTERN_STOP", "0").strip().lower()
         self.enable_repeat_pattern_stop = repeat_stop_env not in {"0", "false", "no", "off", ""}
         self._dense_slide_warned = False
         self.input_token = torch.zeros(1, dtype=torch.int32, device=self.device)
-        # warmup
-        self.model(self.input_token[None, :], caches=self.caches)
+        # warmup: trigger Triton JIT. With CPU offload only need one layer
+        # since all layers share the same kernel shapes.
+        if self.cpu_offload:
+            x = self.model.embedding(self.input_token[None, :])
+            x = self.model.block[0](x, cache=self.caches[0])
+        else:
+            self.model(self.input_token[None, :], caches=self.caches)
         self._sampling_graph = None
         self._greedy_graph = None
         self._greedy_token: torch.Tensor | None = None

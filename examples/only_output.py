@@ -11,7 +11,14 @@ if __name__ == "__main__":
         type=str,
         help="Path to the SafeTensors checkpoint (default: %(default)s with modelscope)"
     )
+    parser.add_argument(
+        "--cpu-offload",
+        action="store_true",
+        default=None,
+        dest="cpu_offload",
+        help="Enable CPU offload for MoE expert weights",
+    )
     args = parser.parse_args()
     checkpoint = get_model_with_checkpoint(args.checkpoint)
-    tool = HarmonyChatTool(checkpoint, reasoning_effort="high")
+    tool = HarmonyChatTool(checkpoint, reasoning_effort="high", cpu_offload=args.cpu_offload)
     result = tool.only_output()
