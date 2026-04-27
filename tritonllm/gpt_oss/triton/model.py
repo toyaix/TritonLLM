@@ -818,23 +818,52 @@ class MLPBlock(torch.nn.Module):
 
     def _forward_decode_offload(self, t: torch.Tensor, gate_bias: torch.Tensor) -> torch.Tensor:
         cache = self.expert_cache
-        rdata, gather_indx, scatter_indx = moe_decode_gate_routing(
-            t, self.gate["weight"], gate_bias,
-            experts_per_token=self.experts_per_token,
-            num_experts=self.num_experts,
-        )
-        if rdata is None:
-            return t
-        expert_ids = torch.where(rdata.expt_hist > 0)[0]
+
+        if cache.route_graph is None:
+            # First call: run routing + matmul eagerly, then capture both graphs
+            rdata, gather_indx, scatter_indx = moe_decode_gate_routing(
+                t, self.gate["weight"], gate_bias,
+                experts_per_token=self.experts_per_token,
+                num_experts=self.num_experts,
+            )
+            if rdata is None:
+                return t
+            expert_ids = torch.where(rdata.expt_hist > 0)[0]
+            cache.ensure_experts(self.layer_idx, expert_ids.tolist())
+
+            t_out = moe_decode_experts(
+                t,
+                cache.gpu_w1, cache.gpu_w1_mx,
+                cache.gpu_w2, cache.gpu_w2_mx,
+                cache.gpu_b1, cache.gpu_b2,
+                rdata, gather_indx, scatter_indx,
+                swiglu_limit=self.swiglu_limit,
+            )
+
+            cache.init_route_graph(
+                t, self.gate["weight"], gate_bias,
+                experts_per_token=self.experts_per_token,
+                num_experts=self.num_experts,
+            )
+            cache.init_decode_graph(rdata, gather_indx, scatter_indx, swiglu_limit=self.swiglu_limit)
+            cache._g_x.copy_(t)
+            cache._g_out.copy_(t_out)
+            return t_out
+
+        # Replay path: route graph → copy experts → matmul graph
+        cache._gr_t.copy_(t)
+        cache._gr_wg.copy_(self.gate["weight"])
+        if cache._gr_bg is not None and gate_bias is not None:
+            cache._gr_bg.copy_(gate_bias)
+
+        cache.route_graph.replay()
+        expert_ids = torch.where(cache._gr_rdata.expt_hist > 0)[0]
         cache.ensure_experts(self.layer_idx, expert_ids.tolist())
-        return moe_decode_experts(
-            t,
-            cache.gpu_w1, cache.gpu_w1_mx,
-            cache.gpu_w2, cache.gpu_w2_mx,
-            cache.gpu_b1, cache.gpu_b2,
-            rdata, gather_indx, scatter_indx,
-            swiglu_limit=self.swiglu_limit,
-        )
+
+        cache.route_to_matmul_proxies()
+        cache._g_x.copy_(t)
+        cache.decode_graph.replay()
+        return cache._g_out
 
 class TransformerBlock(torch.nn.Module):
     def __init__(
@@ -1095,12 +1124,11 @@ class TokenGenerator:
             cpu_offload_env = os.getenv("CPU_OFFLOAD", "0").strip().lower()
             cpu_offload = cpu_offload_env not in {"0", "false", "no", "off", ""}
         self.cpu_offload = cpu_offload
-        self.use_cuda_graph = (
+        self.use_global_cuda_graph = (
             os.getenv("CUDA_GRAPH", "1").strip().lower() not in {"0", "false", "no", "off"}
         )
-        if self.use_cuda_graph and self.cpu_offload:
-            print("CPU offload is incompatible with CUDA Graph; disabling CUDA Graph", flush=True)
-            self.use_cuda_graph = False
+        if self.use_global_cuda_graph and self.cpu_offload:
+            self.use_global_cuda_graph = False  # global graph incompatible; per-layer graphs used instead
         print(termcolor.colored("Loading model checkpoint...", "yellow"), flush=True)
         if self.cpu_offload:
             print(termcolor.colored("CPU_OFFLOAD enabled: MoE expert weights on CPU, attention on GPU", "yellow"), flush=True)
@@ -1123,7 +1151,7 @@ class TokenGenerator:
         self._sampling_graph = None
         self._greedy_graph = None
         self._greedy_token: torch.Tensor | None = None
-        if self.use_cuda_graph:
+        if self.use_global_cuda_graph:
             self._sampling_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self._sampling_graph):
                 self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
@@ -1132,7 +1160,8 @@ class TokenGenerator:
                 self._greedy_token = self.model.forward_greedy(self.input_token[None, :], caches=self.caches)
         else:
             self.logits = None
-            print(termcolor.colored("CUDA Graph disabled, using eager mode", "yellow"), flush=True)
+            if not self.cpu_offload:
+                print(termcolor.colored("CUDA Graph disabled, using eager mode", "yellow"), flush=True)
         self._sampling_probs = torch.empty(self.model.config.vocab_size, device=self.device, dtype=torch.bfloat16)
         self.last_generation_stats = None
         if self.enable_dense_cache_sliding:
@@ -1265,9 +1294,9 @@ class TokenGenerator:
                     if not can_continue:
                         return
                     self.input_token[0] = predicted_token
-                    if self.use_cuda_graph and self._greedy_graph is not None and temperature == 0.0:
+                    if self.use_global_cuda_graph and self._greedy_graph is not None and temperature == 0.0:
                         self._greedy_graph.replay()
-                    elif self.use_cuda_graph:
+                    elif self.use_global_cuda_graph:
                         self._sampling_graph.replay()
                     else:
                         self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
@@ -1292,13 +1321,13 @@ class TokenGenerator:
                 break
             self.input_token[0] = predicted_token
             if use_fused_greedy:
-                if self.use_cuda_graph:
+                if self.use_global_cuda_graph:
                     self._greedy_graph.replay()
                     predicted_token = self._greedy_token.item()
                 else:
                     predicted_token = self.model.forward_greedy(self.input_token[None, :], caches=self.caches).item()
             else:
-                if self.use_cuda_graph:
+                if self.use_global_cuda_graph:
                     self._sampling_graph.replay()
                 else:
                     self.logits = self.model(self.input_token[None, :], caches=self.caches)[0]
