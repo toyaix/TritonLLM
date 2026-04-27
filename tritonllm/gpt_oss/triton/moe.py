@@ -1,4 +1,3 @@
-import os
 import torch
 from torch.profiler import record_function
 
@@ -136,12 +135,10 @@ def moe_decode_experts(
     pc1 = PrecisionConfig(weight_scale=w1_mx, flex_ctx=FlexCtx(rhs_data=InFlexData()))
     pc2 = PrecisionConfig(weight_scale=w2_mx, flex_ctx=FlexCtx(rhs_data=InFlexData()))
 
-    _block_k = int(os.environ["MOE_BLOCK_K"]) if os.environ.get("MOE_BLOCK_K") else None
+    update_opt_flags_constraints({"block_k": 64})
 
     if fused_act:
         assert interleaved, "Fused activation requires interleaved weights"
-        if _block_k is not None:
-            update_opt_flags_constraints({"block_k": _block_k})
         with record_function("w1+swiglu_decode"):
             act = FusedActivation(
                 FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
@@ -154,15 +151,11 @@ def moe_decode_experts(
                 fused_activation=act,
             )
     else:
-        if _block_k is not None:
-            update_opt_flags_constraints({"block_k": _block_k})
         with record_function("w1_decode"):
             x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1)
         with record_function("swiglu_decode"):
             x = swiglu(x, limit=swiglu_limit, interleaved=interleaved)
 
-    if _block_k is not None:
-        update_opt_flags_constraints({"block_k": _block_k})
     with record_function("w2_decode"):
         x = matmul_ogs(
             x, w2, b2, rdata,
@@ -170,8 +163,6 @@ def moe_decode_experts(
             precision_config=pc2,
             gammas=rdata.gate_scal,
         )
-    if _block_k is not None:
-        reset_opt_flags_constraints()
     return x
 
 
