@@ -50,6 +50,11 @@ class ExpertCache:
         # Track which layer's data is currently in each GPU expert slot (CPU-side)
         self.gpu_layer: list[int] = []  # [layer_idx] * num_experts, -1 = invalid
 
+        # GPU hot-layer cache: permanent GPU storage for selected layers
+        # gpu_cache[layer_idx] = {"w1": raw_tensor, "w2": ..., "b1": ..., "b2": ...}
+        self.gpu_cache: dict[int, dict[str, torch.Tensor]] = {}
+        self._cache_bytes_per_layer: int = 0
+
         # Per-layer CUDA graph: gate routing (captured once, shared across layers)
         self.route_graph: torch.cuda.CUDAGraph | None = None
         self._gr_t: torch.Tensor | None = None        # input activation buffer
@@ -87,10 +92,12 @@ class ExpertCache:
         w2,           # custom Tensor, shape (E, ...)
         w2_mx,        # MXFP4 scales
         b2: torch.Tensor,   # (E, hidden_size) bf16
+        cache_on_gpu: bool = False,
     ) -> None:
         """Store per-expert CPU copies and initialise global GPU buffers.
 
         Called once per MLP layer after weight loading + quantization.
+        When ``cache_on_gpu=True``, weights stay on GPU for fast D2D access.
         """
         # Allocate global GPU buffers on first call (keep first layer's tensors)
         if self.gpu_w1 is None:
@@ -106,20 +113,67 @@ class ExpertCache:
             )
             self.gpu_layer = [-1] * self.num_experts
 
-        # Slice by expert and move to CPU (via .storage.data for custom Tensors)
-        cpu_layer: dict[int, dict[str, torch.Tensor]] = {}
-        for eid in range(self.num_experts):
-            cpu_layer[eid] = {
-                "w1": self._raw_slice_cpu(w1, eid),
-                "w1_mx": self._raw_slice_cpu(w1_mx, eid)
-                if w1_mx is not None else None,
-                "b1": b1[eid].cpu(),
-                "w2": self._raw_slice_cpu(w2, eid),
-                "w2_mx": self._raw_slice_cpu(w2_mx, eid)
-                if w2_mx is not None else None,
-                "b2": b2[eid].cpu(),
+            # Measure per-layer bytes for cache capacity planning
+            w1_raw = self._raw_data(w1)
+            w2_raw = self._raw_data(w2)
+            b1_f32 = b1.to(torch.float32)
+            b2_f32 = b2.to(torch.float32)
+            w1_mx_raw = self._raw_data(w1_mx) if w1_mx is not None else None
+            w2_mx_raw = self._raw_data(w2_mx) if w2_mx is not None else None
+            self._cache_bytes_per_layer = (
+                w1_raw.numel() * w1_raw.element_size() +
+                w2_raw.numel() * w2_raw.element_size() +
+                b1_f32.numel() * 4 +
+                b2_f32.numel() * 4 +
+                (w1_mx_raw.numel() * w1_mx_raw.element_size() if w1_mx_raw is not None else 0) +
+                (w2_mx_raw.numel() * w2_mx_raw.element_size() if w2_mx_raw is not None else 0)
+            )
+
+        if cache_on_gpu:
+            # Keep raw tensors on GPU for fast D2D copies
+            self.gpu_cache[layer_idx] = {
+                "w1": self._raw_data(w1),
+                "w1_mx": self._raw_data(w1_mx) if w1_mx is not None else None,
+                "b1": b1.to(torch.float32),
+                "w2": self._raw_data(w2),
+                "w2_mx": self._raw_data(w2_mx) if w2_mx is not None else None,
+                "b2": b2.to(torch.float32),
             }
-        self.cpu[layer_idx] = cpu_layer
+            # Also store CPU copies for the non-cache path if needed
+            cpu_layer: dict[int, dict[str, torch.Tensor]] = {}
+            for eid in range(self.num_experts):
+                cpu_layer[eid] = {
+                    "w1": self._raw_slice_cpu(w1, eid),
+                    "w1_mx": self._raw_slice_cpu(w1_mx, eid)
+                    if w1_mx is not None else None,
+                    "b1": b1[eid].cpu(),
+                    "w2": self._raw_slice_cpu(w2, eid),
+                    "w2_mx": self._raw_slice_cpu(w2_mx, eid)
+                    if w2_mx is not None else None,
+                    "b2": b2[eid].cpu(),
+                }
+            self.cpu[layer_idx] = cpu_layer
+        else:
+            cpu_layer: dict[int, dict[str, torch.Tensor]] = {}
+            for eid in range(self.num_experts):
+                cpu_layer[eid] = {
+                    "w1": self._raw_slice_cpu(w1, eid),
+                    "w1_mx": self._raw_slice_cpu(w1_mx, eid)
+                    if w1_mx is not None else None,
+                    "b1": b1[eid].cpu(),
+                    "w2": self._raw_slice_cpu(w2, eid),
+                    "w2_mx": self._raw_slice_cpu(w2_mx, eid)
+                    if w2_mx is not None else None,
+                    "b2": b2[eid].cpu(),
+                }
+            self.cpu[layer_idx] = cpu_layer
+
+    @staticmethod
+    def _raw_data(tensor) -> torch.Tensor:
+        """Return the underlying torch.Tensor for a regular or custom Tensor."""
+        if hasattr(tensor, "storage") and hasattr(tensor.storage, "data"):
+            return tensor.storage.data
+        return tensor
 
     @staticmethod
     def _raw_slice_cpu(tensor, index: int) -> torch.Tensor:
@@ -138,8 +192,38 @@ class ExpertCache:
     # Public API
     # ------------------------------------------------------------------
 
+    def init_layer_cache(self, max_layers: int = 0) -> int:
+        """Determine how many hot layers can be cached in free GPU memory.
+
+        Returns the number of layers that can be cached (0 if insufficient VRAM).
+        The caller should then call ``cache_on_gpu=True`` during
+        ``register_layer`` for the first *n* layers.
+        """
+        if self._cache_bytes_per_layer == 0 or max_layers <= 0:
+            return 0
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        # Reserve 2 GB for inference overhead (activations, CUDA graphs, etc.)
+        usable = max(0, free - 2 * 1024**3)
+        n = min(max_layers, int(usable // self._cache_bytes_per_layer))
+        if n > 0:
+            print(f"GPU layer cache: {n} slots "
+                  f"({self._cache_bytes_per_layer * n / 1e9:.2f} GB of "
+                  f"{free / 1e9:.2f} GB free VRAM)")
+        else:
+            print(f"GPU layer cache: insufficient free VRAM "
+                  f"(need {self._cache_bytes_per_layer / 1e9:.2f} GB/layer, "
+                  f"{free / 1e9:.2f} GB free)")
+        return n
+
+    def is_cached(self, layer_idx: int) -> bool:
+        return layer_idx in self.gpu_cache
+
     def ensure_experts(self, layer_idx: int, expert_ids: list[int]) -> None:
-        """Synchronously copy expert weights from CPU → GPU if not already present."""
+        """Copy expert weights to GPU shared buffers if not already present.
+
+        Uses GPU→GPU D2D copy for hot-cached layers, CPU→GPU copy otherwise.
+        """
         gpu_w1_raw = self.gpu_w1.storage.data
         gpu_w2_raw = self.gpu_w2.storage.data
         gpu_w1_mx_raw = (
@@ -152,8 +236,33 @@ class ExpertCache:
             if self.gpu_w2_mx is not None and hasattr(self.gpu_w2_mx, "storage")
             else self.gpu_w2_mx
         )
-        cpu_layer = self.cpu[layer_idx]
 
+        cached = self.gpu_cache.get(layer_idx)
+        if cached is not None:
+            # Hot-layer path: D2D copy from permanent GPU cache
+            cw1 = cached["w1"]
+            cw1_mx = cached["w1_mx"]
+            cb1 = cached["b1"]
+            cw2 = cached["w2"]
+            cw2_mx = cached["w2_mx"]
+            cb2 = cached["b2"]
+            for eid in expert_ids:
+                eid_i = int(eid)
+                if self.gpu_layer[eid_i] == layer_idx:
+                    continue
+                gpu_w1_raw[eid_i].copy_(cw1[eid_i])
+                if gpu_w1_mx_raw is not None and cw1_mx is not None:
+                    gpu_w1_mx_raw[eid_i].copy_(cw1_mx[eid_i])
+                self.gpu_b1[eid_i].copy_(cb1[eid_i])
+                gpu_w2_raw[eid_i].copy_(cw2[eid_i])
+                if gpu_w2_mx_raw is not None and cw2_mx is not None:
+                    gpu_w2_mx_raw[eid_i].copy_(cw2_mx[eid_i])
+                self.gpu_b2[eid_i].copy_(cb2[eid_i])
+                self.gpu_layer[eid_i] = layer_idx
+            return
+
+        # Cold-layer path: CPU→GPU copy from pageable CPU storage
+        cpu_layer = self.cpu[layer_idx]
         for eid in expert_ids:
             eid_i = int(eid)
             if self.gpu_layer[eid_i] == layer_idx:

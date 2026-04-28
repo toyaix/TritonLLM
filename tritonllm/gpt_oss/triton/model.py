@@ -1000,6 +1000,9 @@ class Transformer(torch.nn.Module):
             device=device,
         )
 
+        # Determine how many hot layers can be cached on GPU
+        _n_cache = cache.init_layer_cache(max_layers=10)
+
         # Phase 1: load non-MLP params normally (small, stay on GPU)
         for name, param in self.named_parameters():
             if "mlp1" in name or "mlp2" in name:
@@ -1079,22 +1082,25 @@ class Transformer(torch.nn.Module):
 
             mlp.refresh_fp32_bias_caches()
 
+            _hot = block_idx < _n_cache
             cache.register_layer(
                 block_idx,
                 w1, w1_mx, mlp.mlp1_bias,
                 w2, w2_mx, mlp.mlp2_bias,
+                cache_on_gpu=_hot,
             )
             mlp._cpu_offload = True
             mlp.expert_cache = cache
 
-            # Free GPU expert tensors for this layer
-            mlp.mlp1_weight_tensor = torch.empty(1, device=device)
-            mlp.mlp1_weight_mx = torch.empty(1, device=device)
-            mlp.mlp2_weight_tensor = torch.empty(1, device=device)
-            mlp.mlp2_weight_mx = torch.empty(1, device=device)
-            mlp.mlp1_weight = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
-            mlp.mlp1_bias = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
-            mlp.mlp2_bias = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
+            if not _hot:
+                # Free GPU expert tensors for this layer (cold layers)
+                mlp.mlp1_weight_tensor = torch.empty(1, device=device)
+                mlp.mlp1_weight_mx = torch.empty(1, device=device)
+                mlp.mlp2_weight_tensor = torch.empty(1, device=device)
+                mlp.mlp2_weight_mx = torch.empty(1, device=device)
+                mlp.mlp1_weight = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
+                mlp.mlp1_bias = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
+                mlp.mlp2_bias = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
 
             torch.cuda.empty_cache()
 
