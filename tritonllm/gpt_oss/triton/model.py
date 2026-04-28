@@ -1115,17 +1115,7 @@ class Transformer(torch.nn.Module):
         _final = torch.cuda.memory_stats().get('allocated_bytes.all.current', 0)
         print(f"GPU after Phase 2 + restore: {_final/1e9:.2f} GB")
 
-        # Initialise hot-layer GPU cache using free VRAM
-        n_cache = cache.init_layer_cache(max_layers=10)
-        if n_cache > 0:
-            print(f"GPU layer cache: {n_cache} slots ({cache._cache_bytes_per_layer * n_cache / 1e9:.2f} GB)")
-            # Pre-cache the first N layers so the second decode token benefits
-            n_prefill = min(n_cache, len(self.block))
-            for lid in range(n_prefill):
-                cache.cache_layer(lid)
-            print(f"GPU layer cache: pre-filled {n_prefill} layers")
-        else:
-            print("GPU layer cache: insufficient free VRAM")
+        # CPU offload: expert weights stay on CPU, copied to GPU on-demand during decode
 
 
 class TokenGenerator:

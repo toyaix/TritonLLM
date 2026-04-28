@@ -2,13 +2,8 @@
 
 Stores MoE expert weights on CPU (pageable, contiguous per-tensor) and
 maintains shared GPU buffers that are filled on-demand as each layer's
-experts are activated.
-
-Key optimization — GPU hot-layer cache:
-Uses free VRAM to keep the full 128-expert tensor set for N layers
-permanently on GPU.  When a cached layer is hit, its experts are
-copied from the GPU cache to the shared buffers via 6 large GPU→GPU
-copies at ~900 GB/s, avoiding 24 pageable CPU→GPU copies entirely.
+experts are activated.  Only the activated experts (4/128) are transferred
+per layer.
 """
 
 from typing import Optional
@@ -17,11 +12,12 @@ import torch
 
 
 class ExpertCache:
-    """Expert weight cache with hot-layer GPU cache.
+    """Global GPU buffers for expert weights, shared across all layers.
 
-    Shared GPU buffers (128 experts) are reused across all layers.
-    A separate per-layer GPU cache holds the full expert set for
-    frequently-accessed layers, eliminating CPU→GPU transfers.
+    Each layer's expert weights are stored on CPU as contiguous pageable
+    tensors whose layout matches the GPU buffers (``(num_experts, ...)``).
+    Before each MLP forward the activated experts for that layer are copied
+    from CPU into the corresponding GPU slots.
     """
 
     def __init__(
@@ -37,7 +33,7 @@ class ExpertCache:
         # Per-layer pageable CPU storage — contiguous per-tensor
         self.cpu: dict[int, dict[str, torch.Tensor]] = {}
 
-        # Global GPU buffers — shared across all layers (128 experts)
+        # Global GPU buffers — the custom Tensor objects themselves
         self.gpu_w1 = None
         self.gpu_w1_mx = None
         self.gpu_b1: Optional[torch.Tensor] = None
@@ -47,17 +43,6 @@ class ExpertCache:
 
         # Track which layer is in each GPU slot
         self.gpu_layer: list[int] = []
-
-        # ---- Hot-layer GPU cache ----
-        # Per-layer full (128-expert) GPU tensors that persist across tokens.
-        # When a cached layer is requested, 6 big GPU→GPU copies replace
-        # 24 small CPU→GPU copies.
-        self._cache: dict[int, dict[str, torch.Tensor]] = {}
-        self._cache_order: list[int] = []  # LRU: front=MRU, back=LRU
-        self._cache_capacity: int = 0
-        self._cache_bytes_per_layer: int = 0
-        self._cache_hits: int = 0
-        self._cache_misses: int = 0
 
         # ---- CUDA Graph: gate routing ----
         self.route_graph: torch.cuda.CUDAGraph | None = None
@@ -143,24 +128,16 @@ class ExpertCache:
                 yield key, t
 
     # ------------------------------------------------------------------
-    # Public API — shared GPU buffers (CPU→GPU)
+    # Public API
     # ------------------------------------------------------------------
 
     def ensure_experts(self, layer_idx: int, expert_ids: list[int]) -> None:
         """Copy expert weights from CPU → GPU if not already present.
 
-        If *layer_idx* is in the hot-layer GPU cache, copies from the
-        cache (GPU→GPU at ~900 GB/s) instead of from CPU.
+        CPU storage is contiguous per-tensor (shape ``(num_experts, ...)``),
+        so each ``cpu_tensor[eid]`` is a contiguous slice that maps directly
+        to the corresponding GPU slot.
         """
-        # Hot-layer cache hit: copy from GPU cache → shared GPU buffers
-        if layer_idx in self._cache:
-            self._copy_from_cache(layer_idx)
-            self._cache_hits += 1
-            self._touch_cache(layer_idx)
-            return
-
-        # Cache miss: copy from pageable CPU
-        self._cache_misses += 1
         gpu_w1_raw = self._raw_data(self.gpu_w1)
         gpu_w2_raw = self._raw_data(self.gpu_w2)
         gpu_w1_mx_raw = self._raw_data(self.gpu_w1_mx) if self.gpu_w1_mx is not None else None
@@ -198,144 +175,6 @@ class ExpertCache:
     def load_all_experts(self, layer_idx: int) -> None:
         """Load every expert into the shared GPU buffers (for prefill)."""
         self.ensure_experts(layer_idx, list(range(self.num_experts)))
-
-    # ------------------------------------------------------------------
-    # Hot-layer GPU cache
-    # ------------------------------------------------------------------
-
-    def init_layer_cache(self, max_layers: int = 999) -> int:
-        """Determine how many full-layer GPU caches fit in free VRAM.
-
-        Must be called after all ``register_layer`` calls so that tensor
-        sizes are known.  Returns the actual number of cache slots
-        available.  Actual GPU allocation is deferred to ``cache_layer``.
-        """
-        gpu_w1_raw = self._raw_data(self.gpu_w1)
-        gpu_w2_raw = self._raw_data(self.gpu_w2)
-
-        total_bytes = (
-            gpu_w1_raw.numel() * gpu_w1_raw.element_size()
-            + gpu_w2_raw.numel() * gpu_w2_raw.element_size()
-            + self.gpu_b1.numel() * self.gpu_b1.element_size()
-            + self.gpu_b2.numel() * self.gpu_b2.element_size()
-        )
-        if self.gpu_w1_mx is not None:
-            total_bytes += self._raw_data(self.gpu_w1_mx).numel() * self._raw_data(self.gpu_w1_mx).element_size()
-        if self.gpu_w2_mx is not None:
-            total_bytes += self._raw_data(self.gpu_w2_mx).numel() * self._raw_data(self.gpu_w2_mx).element_size()
-
-        self._cache_bytes_per_layer = total_bytes
-
-        free, _ = torch.cuda.mem_get_info(self.device)
-        # Reserve 2 GB for KV cache, activations, CUDA graph workspace.
-        inference_headroom = 2 * 1024**3
-        usable = max(0, int(free) - inference_headroom)
-        self._cache_capacity = min(max_layers, max(0, usable // total_bytes))
-        if self._cache_capacity > 0:
-            print(f"[cache] {self._cache_capacity} layer slots "
-                  f"({self._cache_capacity * total_bytes / 1e9:.2f} GB) "
-                  f"from {usable / 1e9:.2f} GB usable VRAM")
-
-        # Deferred allocation — actual GPU tensors created in cache_layer
-        self._cache_order = [-1] * self._cache_capacity
-
-        return self._cache_capacity
-
-    def cache_layer(self, layer_idx: int) -> bool:
-        """Fill the GPU cache for *layer_idx* from CPU pageable storage.
-
-        Returns True if the layer was cached, False if cache is disabled
-        or the layer is already cached.
-        """
-        if self._cache_capacity == 0:
-            return False
-        if layer_idx in self._cache:
-            self._touch_cache(layer_idx)
-            return True
-
-        # Evict LRU layer if cache is full
-        if len(self._cache) >= self._cache_capacity:
-            evict_idx = self._cache_order[-1]
-            if evict_idx >= 0 and evict_idx in self._cache:
-                del self._cache[evict_idx]
-                self._cache_order[-1] = -1
-
-        # Find a free slot
-        slot = -1
-        for i, lid in enumerate(self._cache_order):
-            if lid < 0 or lid not in self._cache:
-                slot = i
-                break
-        if slot < 0:
-            slot = len(self._cache_order) - 1  # reuse last slot
-
-        # Allocate buffers in this slot if first use
-        if self._cache_order[slot] < 0:
-            # Already allocated in init_layer_cache; just assign
-            self._cache_order[slot] = layer_idx
-            self._cache[layer_idx] = {}  # filled below
-
-        # Copy all 128 experts from pageable CPU to GPU cache
-        cpu_layer = self.cpu[layer_idx]
-        cache_entry = self._cache.setdefault(layer_idx, {})
-        for key in ["w1", "w1_mx", "b1", "w2", "w2_mx", "b2"]:
-            if key in cpu_layer:
-                if key not in cache_entry:
-                    # Allocate on first use
-                    cache_entry[key] = cpu_layer[key].to(self.device)
-                else:
-                    cache_entry[key].copy_(cpu_layer[key])
-
-        self._touch_cache(layer_idx)
-        return True
-
-    def cache_stats(self) -> dict:
-        """Return cache hit/miss counters."""
-        total = self._cache_hits + self._cache_misses
-        return {
-            "hits": self._cache_hits,
-            "misses": self._cache_misses,
-            "hit_rate": self._cache_hits / total if total > 0 else 0.0,
-            "capacity": self._cache_capacity,
-            "active": len(self._cache),
-            "bytes_per_layer_mb": self._cache_bytes_per_layer / (1024 * 1024),
-        }
-
-    def _copy_from_cache(self, layer_idx: int) -> None:
-        """Copy all 128 experts from GPU cache → shared GPU buffers.
-
-        Six large contiguous GPU→GPU copies at ~900 GB/s, replacing
-        24 small pageable CPU→GPU copies at ~15 GB/s.
-        """
-        cache_entry = self._cache[layer_idx]
-        gpu_w1_raw = self._raw_data(self.gpu_w1)
-        gpu_w2_raw = self._raw_data(self.gpu_w2)
-
-        gpu_w1_raw.copy_(cache_entry["w1"])
-        if self.gpu_w1_mx is not None and "w1_mx" in cache_entry:
-            self._raw_data(self.gpu_w1_mx).copy_(cache_entry["w1_mx"])
-        self.gpu_b1.copy_(cache_entry["b1"])
-        gpu_w2_raw.copy_(cache_entry["w2"])
-        if self.gpu_w2_mx is not None and "w2_mx" in cache_entry:
-            self._raw_data(self.gpu_w2_mx).copy_(cache_entry["w2_mx"])
-        self.gpu_b2.copy_(cache_entry["b2"])
-
-        # Mark all 128 GPU slots as belonging to this layer
-        for eid in range(self.num_experts):
-            self.gpu_layer[eid] = layer_idx
-
-    def _touch_cache(self, layer_idx: int) -> None:
-        """Move *layer_idx* to the front of the LRU order."""
-        if layer_idx in self._cache_order:
-            self._cache_order.remove(layer_idx)
-        while len(self._cache_order) < self._cache_capacity:
-            self._cache_order.append(-1)
-        self._cache_order.insert(0, layer_idx)
-        # Trim to capacity
-        while len(self._cache_order) > self._cache_capacity:
-            removed = self._cache_order.pop()
-            if removed >= 0 and removed in self._cache:
-                del self._cache[removed]
 
     # ------------------------------------------------------------------
     # CUDA Graph (decode matmul)
@@ -444,6 +283,4 @@ class ExpertCache:
         self.gpu_w2 = None
         self.gpu_w2_mx = None
         self.gpu_b2 = None
-        self._cache.clear()
-        self._cache_order.clear()
         self.gpu_layer = []
