@@ -19,7 +19,6 @@ else:
     from gpt_oss.triton.attention_tt_tma import attention
 
 from gpt_oss.triton.moe import quantize_mx4, moe, moe_decode, moe_decode_gate_routing, moe_decode_experts, moe_gate_routing, moe_experts
-from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
 from gpt_oss.triton.expert_cache import ExpertCache
 from gpt_oss.triton.triton_kernels import (
     out_residual_decode_forward,
@@ -820,20 +819,6 @@ class MLPBlock(torch.nn.Module):
     def _forward_decode_offload(self, t: torch.Tensor, gate_bias: torch.Tensor) -> torch.Tensor:
         cache = self.expert_cache
 
-        # ---- CPU expert path ----
-        if os.getenv("CPU_EXPERT", "0").strip().lower() not in {"0", "false", "no", "off", ""}:
-            logits = torch.matmul(t, self.gate["weight"]).float()
-            if gate_bias is not None:
-                logits = logits + gate_bias
-            topk_weights, topk_indices = torch.topk(logits, self.experts_per_token)
-            topk_weights = torch.softmax(topk_weights, dim=-1)
-            return cache.cpu_expert_forward(
-                self.layer_idx, t,
-                topk_indices[0].tolist(),  # [experts_per_token]
-                topk_weights[0],           # [experts_per_token]
-                swiglu_limit=self.swiglu_limit,
-            )
-
         if cache.route_graph is None:
             # First call: run routing + matmul eagerly, then capture both graphs
             rdata, gather_indx, scatter_indx = moe_decode_gate_routing(
@@ -1008,7 +993,6 @@ class Transformer(torch.nn.Module):
         torch.cuda.empty_cache()
 
     def _load_with_cpu_offload(self, checkpoint: Checkpoint, config: ModelConfig) -> None:
-        _cpu_expert = os.getenv("CPU_EXPERT", "0").strip().lower() not in {"0", "false", "no", "off", ""}
         device = torch.device("cuda")
         cache = ExpertCache(
             num_experts=config.num_experts,
@@ -1067,18 +1051,13 @@ class Transformer(torch.nn.Module):
             loaded_t = loaded.mT.contiguous()
             del loaded
             w1, w1_mx = quantize_mx4(loaded_t)
-            # Simple (non-swizzled) FP4 for CPU-side: move to CPU first to free GPU mem
-            loaded_cpu = loaded_t.cpu()
             del loaded_t
-            w1_fp4, w1_fp4_scale = downcast_to_mxfp_torch(loaded_cpu, torch.uint8, axis=1)
-            del loaded_cpu
             mlp.mlp1_weight_tensor = w1
             mlp.mlp1_weight_mx = w1_mx
             mlp.mlp1_weight = torch.nn.Parameter(w1.storage.data, requires_grad=False)
 
             # mlp1_bias
             loaded = checkpoint.get(f"block.{block_idx}.mlp.mlp1_bias")
-            b1 = loaded.detach()
             mlp.mlp1_bias = torch.nn.Parameter(loaded, requires_grad=False)
             del loaded
 
@@ -1088,17 +1067,13 @@ class Transformer(torch.nn.Module):
             loaded_t = loaded.mT.contiguous()
             del loaded
             w2, w2_mx = quantize_mx4(loaded_t)
-            loaded_cpu = loaded_t.cpu()
             del loaded_t
-            w2_fp4, w2_fp4_scale = downcast_to_mxfp_torch(loaded_cpu, torch.uint8, axis=1)
-            del loaded_cpu
             mlp.mlp2_weight_tensor = w2
             mlp.mlp2_weight_mx = w2_mx
             mlp.mlp2_weight = torch.nn.Parameter(w2.storage.data, requires_grad=False)
 
             # mlp2_bias
             loaded = checkpoint.get(f"block.{block_idx}.mlp.mlp2_bias")
-            b2 = loaded.detach()
             mlp.mlp2_bias = torch.nn.Parameter(loaded, requires_grad=False)
             del loaded
 
@@ -1108,13 +1083,7 @@ class Transformer(torch.nn.Module):
                 block_idx,
                 w1, w1_mx, mlp.mlp1_bias,
                 w2, w2_mx, mlp.mlp2_bias,
-                store_cpu=not _cpu_expert,
             )
-            cache.register_cpu_fp4(
-                block_idx, w1_fp4, w1_fp4_scale, b1,
-                w2_fp4, w2_fp4_scale, b2,
-            )
-            del w1_fp4, w1_fp4_scale, b1, w2_fp4, w2_fp4_scale, b2
             mlp._cpu_offload = True
             mlp.expert_cache = cache
 
@@ -1145,8 +1114,6 @@ class Transformer(torch.nn.Module):
 
         _final = torch.cuda.memory_stats().get('allocated_bytes.all.current', 0)
         print(f"GPU after Phase 2 + restore: {_final/1e9:.2f} GB")
-
-        # CPU offload: expert weights stay on CPU, copied to GPU on-demand during decode
 
 
 class TokenGenerator:
