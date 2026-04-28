@@ -67,7 +67,8 @@ def chat(args):
     tokenizer = get_tokenizer()
     checkpoint = get_model_with_checkpoint(args.checkpoint)
     from .triton.model import TokenGenerator as TritonGenerator
-    generator = TritonGenerator(checkpoint, args.context, device)
+    cpu_offload = getattr(args, 'cpu_offload', None)
+    generator = TritonGenerator(checkpoint, args.context, device, cpu_offload=cpu_offload)
 
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
@@ -388,5 +389,12 @@ def get_parser_args():
         default=False,
         action="store_true",
         help="Raw mode (does not render Harmony encoding)",
+    )
+    parser.add_argument(
+        "--cpu-offload",
+        action="store_true",
+        default=None,
+        dest="cpu_offload",
+        help="Enable CPU offload for MoE expert weights",
     )
     return parser.parse_args()

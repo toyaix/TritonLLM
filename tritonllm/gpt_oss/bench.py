@@ -62,7 +62,7 @@ class HarmonyChatTool:
                  reasoning_effort: str = "high", developer_message: str = "",
                  enable_browser: bool = False, enable_python: bool = False,
                  enable_apply_patch: bool = False, show_browser_results: bool = False,
-                 raw_mode: bool = False):
+                 raw_mode: bool = False, cpu_offload: bool | None = None):
         self.checkpoint_path = checkpoint_path
         self.context_length = context_length
         self.reasoning_effort = reasoning_effort
@@ -72,6 +72,7 @@ class HarmonyChatTool:
         self.enable_apply_patch = enable_apply_patch
         self.show_browser_results = show_browser_results
         self.raw_mode = raw_mode
+        self.cpu_offload = cpu_offload
 
         # Initialize components
         self.device = torch.device("cuda:0")
@@ -122,16 +123,16 @@ class HarmonyChatTool:
         # Initialize generator with loading message
         try:
             from tritonllm.gpt_oss.triton.model import TokenGenerator as TritonGenerator
-            self.generator = TritonGenerator(self.checkpoint_path, self.context_length, self.device)
+            self.generator = TritonGenerator(self.checkpoint_path, self.context_length, self.device, cpu_offload=self.cpu_offload)
         except ImportError:
             try:
                 from gpt_oss.triton.model import TokenGenerator as TritonGenerator
-                self.generator = TritonGenerator(self.checkpoint_path, self.context_length, self.device)
+                self.generator = TritonGenerator(self.checkpoint_path, self.context_length, self.device, cpu_offload=self.cpu_offload)
             except ImportError:
                 try:
                     # Try the new import path from the tools code
                     from .triton.model import TokenGenerator as TritonGenerator
-                    self.generator = TritonGenerator(self.checkpoint_path, self.context_length, self.device)
+                    self.generator = TritonGenerator(self.checkpoint_path, self.context_length, self.device, cpu_offload=self.cpu_offload)
                 except ImportError:
                     raise ImportError("Could not import TokenGenerator. Please check your installation.")
         print(termcolor.colored("✓ Model checkpoint loaded successfully", "green"), flush=True)

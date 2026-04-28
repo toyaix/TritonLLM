@@ -71,7 +71,7 @@ class Checkpoint:
         scales_name: str,
         *,
         dtype: torch.dtype = torch.bfloat16,
-        rows_per_chunk: int = 32768 * 1024,
+        rows_per_chunk: int = 8192 * 1024,
     ) -> torch.Tensor:
         assert blocks_name in self.tensor_name_to_file, (
             f"Blocks tensor {blocks_name} not found in checkpoint."
@@ -103,9 +103,9 @@ class Checkpoint:
             blk = blocks[r0:r1]
             exp = scales[r0:r1]
 
-            # nibble indices -> int64
-            idx_lo = (blk & 0x0F).to(torch.long)
-            idx_hi = (blk >> 4).to(torch.long)
+            # nibble indices -> int32 (saves 50% memory vs int64)
+            idx_lo = (blk & 0x0F).to(torch.int32)
+            idx_hi = (blk >> 4).to(torch.int32)
 
             sub = out[r0:r1]
             sub[:, 0::2] = lut[idx_lo]

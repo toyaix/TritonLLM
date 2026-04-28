@@ -14,7 +14,8 @@ def generate(args):
     from gpt_oss.triton.model import TokenGenerator as TritonGenerator
     device = torch.device(f"cuda:0")
     checkpoint = get_model_with_checkpoint(args.checkpoint)
-    generator = TritonGenerator(checkpoint, context=args.context_length, device=device)
+    cpu_offload = getattr(args, 'cpu_offload', None)
+    generator = TritonGenerator(checkpoint, context=args.context_length, device=device, cpu_offload=cpu_offload)
 
     tokenizer = get_tokenizer()
     tokens = tokenizer.encode(args.prompt)
@@ -67,5 +68,12 @@ def get_parser_args():
         type=int,
         default=4096,
         help="Context length",
+    )
+    parser.add_argument(
+        "--cpu-offload",
+        action="store_true",
+        default=None,
+        dest="cpu_offload",
+        help="Enable CPU offload for MoE expert weights",
     )
     return parser.parse_args()
