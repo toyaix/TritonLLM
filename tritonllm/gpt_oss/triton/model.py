@@ -865,9 +865,12 @@ class MLPBlock(torch.nn.Module):
         cache.decode_graph.replay()
 
         if self.layer_idx == 0 and cache._miss_count + cache._hit_count > 0:
-            hr = cache.hit_rate()
-            print(f"[gpu_layer reuse] hit={cache._hit_count} miss={cache._miss_count} "
-                  f"rate={hr:.1%}", flush=True)
+            if os.getenv("PRINT_HIT_RATE", "0").strip().lower() not in {"0", "false", "no", "off"}:
+                if getattr(cache, '_print_ctr', 0) % 10 == 0:
+                    hr = cache.hit_rate()
+                    print(f"[gpu_layer reuse] hit={cache._hit_count} miss={cache._miss_count} "
+                          f"rate={hr:.1%}")
+            cache._print_ctr = getattr(cache, '_print_ctr', 0) + 1
             cache.reset_hit_rate()
 
         return cache._g_out
@@ -1127,6 +1130,11 @@ class Transformer(torch.nn.Module):
 
         _final = torch.cuda.memory_stats().get('allocated_bytes.all.current', 0)
         print(f"GPU after Phase 2 + restore: {_final/1e9:.2f} GB")
+
+        # Allocate victim cache from remaining free VRAM
+        _vc_env = os.getenv("VICTIM_CACHE", "1").strip().lower()
+        if _vc_env not in {"0", "false", "no", "off"}:
+            cache.init_victim_cache(max_slots=120)
 
 
 class TokenGenerator:

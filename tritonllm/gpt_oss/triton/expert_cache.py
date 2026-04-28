@@ -59,6 +59,21 @@ class ExpertCache:
         self._hit_count: int = 0
         self._miss_count: int = 0
 
+        # Victim cache: manually-managed GPU buffer for evicted expert data.
+        # When a GPU slot is overwritten by a different layer, the old data is
+        # saved here.  On a later reuse, a D2D copy (~900 GB/s) restores it.
+        self._vc_slots: int = 0
+        self._vc_w1: torch.Tensor | None = None
+        self._vc_w1_mx: torch.Tensor | None = None
+        self._vc_b1: torch.Tensor | None = None
+        self._vc_w2: torch.Tensor | None = None
+        self._vc_w2_mx: torch.Tensor | None = None
+        self._vc_b2: torch.Tensor | None = None
+        self._vc_expert_shapes: dict | None = None  # set on first register_layer
+        self._vc_tag: dict[tuple[int, int], int] = {}  # (layer, expert) → slot idx
+        self._vc_free: list[int] = []   # free slot indices
+        self._vc_lru: list[int] = []    # front=LRU, back=MRU
+
         # Per-layer CUDA graph: gate routing (captured once, shared across layers)
         self.route_graph: torch.cuda.CUDAGraph | None = None
         self._gr_t: torch.Tensor | None = None        # input activation buffer
@@ -133,6 +148,19 @@ class ExpertCache:
                 (w2_mx_raw.numel() * w2_mx_raw.element_size() if w2_mx_raw is not None else 0)
             )
 
+            # Save per-expert shapes for deferred victim cache allocation
+            self._vc_expert_shapes = {
+                "w1": w1_raw.shape[1:], "w1_dtype": w1_raw.dtype,
+                "w1_mx": w1_mx_raw.shape[1:] if w1_mx_raw is not None else None,
+                "w1_mx_dtype": w1_mx_raw.dtype if w1_mx_raw is not None else None,
+                "b1": b1_f32.shape[1:],
+                "w2": w2_raw.shape[1:], "w2_dtype": w2_raw.dtype,
+                "w2_mx": w2_mx_raw.shape[1:] if w2_mx_raw is not None else None,
+                "w2_mx_dtype": w2_mx_raw.dtype if w2_mx_raw is not None else None,
+                "b2": b2_f32.shape[1:],
+                "bytes_per_expert": self._cache_bytes_per_layer // self.num_experts,
+            }
+
         if cache_on_gpu:
             # Keep raw tensors on GPU for fast D2D copies
             self.gpu_cache[layer_idx] = {
@@ -193,6 +221,108 @@ class ExpertCache:
         return raw[index].cpu()
 
     # ------------------------------------------------------------------
+    # Victim cache — manually managed GPU memory
+    # ------------------------------------------------------------------
+
+    def init_victim_cache(self, max_slots: int = 200) -> int:
+        """Pre-allocate a contiguous GPU buffer for evicted expert data.
+
+        Must be called AFTER model loading is complete (sufficient free VRAM).
+        Returns the number of allocated cache slots.
+        """
+        if self._vc_expert_shapes is None:
+            return 0
+        s = self._vc_expert_shapes
+        expert_bytes = s["bytes_per_expert"]
+        free, _ = torch.cuda.mem_get_info()
+        usable = max(0, free - 2.5 * 1024**3)  # reserve 2.5 GB for kernels, KV cache, etc.
+        slots = min(int(usable // expert_bytes), max_slots)
+        if slots < self.experts_per_token:
+            print(f"Victim cache: insufficient VRAM "
+                  f"(need {expert_bytes * self.experts_per_token / 1e9:.2f} GB, "
+                  f"have {usable / 1e9:.2f} GB usable). Victim cache disabled.")
+            return 0
+
+        self._vc_slots = slots
+        self._vc_w1 = torch.empty(slots, *s["w1"], dtype=s["w1_dtype"], device=self.device)
+        self._vc_w1_mx = (
+            torch.empty(slots, *s["w1_mx"], dtype=s["w1_mx_dtype"], device=self.device)
+            if s["w1_mx"] is not None else None
+        )
+        self._vc_b1 = torch.empty(slots, *s["b1"], dtype=torch.float32, device=self.device)
+        self._vc_w2 = torch.empty(slots, *s["w2"], dtype=s["w2_dtype"], device=self.device)
+        self._vc_w2_mx = (
+            torch.empty(slots, *s["w2_mx"], dtype=s["w2_mx_dtype"], device=self.device)
+            if s["w2_mx"] is not None else None
+        )
+        self._vc_b2 = torch.empty(slots, *s["b2"], dtype=torch.float32, device=self.device)
+        self._vc_free = list(range(slots))
+        self._vc_tag = {}
+        self._vc_lru = []
+        vc_bytes = slots * expert_bytes
+        print(f"Victim cache: {slots} slots ({vc_bytes / 1e9:.2f} GB, "
+              f"{vc_bytes / 1024**3:.2f} GiB)")
+        return slots
+
+    def _vc_evict_one(self) -> int:
+        """Evict the LRU entry, returning its slot index."""
+        slot = self._vc_lru.pop(0)
+        # Find and remove the tag pointing to this slot
+        for key, s in list(self._vc_tag.items()):
+            if s == slot:
+                del self._vc_tag[key]
+                break
+        return slot
+
+    def _vc_put(self, layer_idx: int, eid_i: int,
+                w1_src, w1_mx_src, b1_src, w2_src, w2_mx_src, b2_src):
+        """Save expert data into the victim cache before it gets overwritten."""
+        key = (layer_idx, eid_i)
+        if key in self._vc_tag:
+            # Already cached — update LRU position
+            slot = self._vc_tag[key]
+            if slot in self._vc_lru:
+                self._vc_lru.remove(slot)
+            self._vc_lru.append(slot)
+            # Still need to refresh the data since shared buffer may have changed
+        else:
+            slot = self._vc_free.pop() if self._vc_free else self._vc_evict_one()
+            self._vc_tag[key] = slot
+            if slot in self._vc_lru:
+                self._vc_lru.remove(slot)
+            self._vc_lru.append(slot)
+
+        self._vc_w1[slot].copy_(w1_src)
+        if self._vc_w1_mx is not None and w1_mx_src is not None:
+            self._vc_w1_mx[slot].copy_(w1_mx_src)
+        self._vc_b1[slot].copy_(b1_src)
+        self._vc_w2[slot].copy_(w2_src)
+        if self._vc_w2_mx is not None and w2_mx_src is not None:
+            self._vc_w2_mx[slot].copy_(w2_mx_src)
+        self._vc_b2[slot].copy_(b2_src)
+
+    def _vc_get(self, layer_idx: int, eid_i: int,
+                w1_dst, w1_mx_dst, b1_dst, w2_dst, w2_mx_dst, b2_dst) -> bool:
+        """Restore expert data from victim cache. Returns True on hit."""
+        key = (layer_idx, eid_i)
+        slot = self._vc_tag.get(key)
+        if slot is None:
+            return False
+        w1_dst.copy_(self._vc_w1[slot])
+        if w1_mx_dst is not None and self._vc_w1_mx is not None:
+            w1_mx_dst.copy_(self._vc_w1_mx[slot])
+        b1_dst.copy_(self._vc_b1[slot])
+        w2_dst.copy_(self._vc_w2[slot])
+        if w2_mx_dst is not None and self._vc_w2_mx is not None:
+            w2_mx_dst.copy_(self._vc_w2_mx[slot])
+        b2_dst.copy_(self._vc_b2[slot])
+        # Update LRU
+        if slot in self._vc_lru:
+            self._vc_lru.remove(slot)
+        self._vc_lru.append(slot)
+        return True
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -226,10 +356,11 @@ class ExpertCache:
     def ensure_experts(self, layer_idx: int, expert_ids: list[int]) -> None:
         """Copy expert weights to GPU shared buffers if not already present.
 
-        Two-path lookup:
+        Three-path lookup:
         1. Hot-layer cache: entire layer permanently on GPU → D2D copy
-        2. CPU→GPU copy: skips experts whose slot already holds this layer's data
-           (retained from a previous token), tracked via gpu_layer.
+        2. gpu_layer match: slot still holds this layer's data from prev token
+        3. Victim cache: data evicted by another layer → D2D restore
+        4. CPU→GPU copy (with victim-cache save of overwritten data)
         """
         gpu_w1_raw = self.gpu_w1.storage.data
         gpu_w2_raw = self.gpu_w2.storage.data
@@ -268,7 +399,7 @@ class ExpertCache:
                 self.gpu_layer[eid_i] = layer_idx
             return
 
-        # Path 2: CPU→GPU copy, skipping experts already resident from previous tokens
+        # Path 2-4: CPU-offloaded layers
         cpu_layer = self.cpu[layer_idx]
 
         for eid in expert_ids:
@@ -276,7 +407,33 @@ class ExpertCache:
             if self.gpu_layer[eid_i] == layer_idx:
                 self._hit_count += 1
                 continue
+
+            # Path 3: victim cache hit → D2D restore
+            if self._vc_slots > 0 and self._vc_get(
+                layer_idx, eid_i,
+                gpu_w1_raw[eid_i], gpu_w1_mx_raw[eid_i] if gpu_w1_mx_raw is not None else None,
+                self.gpu_b1[eid_i],
+                gpu_w2_raw[eid_i], gpu_w2_mx_raw[eid_i] if gpu_w2_mx_raw is not None else None,
+                self.gpu_b2[eid_i],
+            ):
+                self._hit_count += 1
+                self.gpu_layer[eid_i] = layer_idx
+                continue
+
             self._miss_count += 1
+            # Path 4: CPU→GPU copy. Save overwritten data to victim cache first.
+            prev_layer = self.gpu_layer[eid_i]
+            if self._vc_slots > 0 and prev_layer >= 0 and prev_layer != layer_idx:
+                self._vc_put(
+                    prev_layer, eid_i,
+                    gpu_w1_raw[eid_i],
+                    gpu_w1_mx_raw[eid_i] if gpu_w1_mx_raw is not None else None,
+                    self.gpu_b1[eid_i],
+                    gpu_w2_raw[eid_i],
+                    gpu_w2_mx_raw[eid_i] if gpu_w2_mx_raw is not None else None,
+                    self.gpu_b2[eid_i],
+                )
+
             cw = cpu_layer[eid_i]
             gpu_w1_raw[eid_i].copy_(cw["w1"])
             if gpu_w1_mx_raw is not None and cw.get("w1_mx") is not None:
