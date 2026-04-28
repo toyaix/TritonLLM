@@ -93,12 +93,15 @@ def num_sms():
 
 @constexpr_function
 def has_tma_gather():
+    # TMA gather works on both data center Blackwell (sm_100x) and consumer
+    # Blackwell (sm_120a / RTX 5090).  Verified on RTX 5090 hardware.
     return cuda_capability_geq(10, 0)
 
 
 @constexpr_function
 def has_tma_scatter():
-    # Same limitation as TMA gather: requires data center Blackwell (sm_100x).
+    # TMA scatter with .shared::cluster requires data center Blackwell (sm_100x).
+    # Not available on consumer Blackwell sm_120a (RTX 5090).
     return cuda_capability_geq(10, 0) and not cuda_capability_eq(12, 0)
 
 
