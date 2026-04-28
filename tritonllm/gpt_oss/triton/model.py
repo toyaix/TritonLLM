@@ -1003,15 +1003,16 @@ class Transformer(torch.nn.Module):
         torch.cuda.empty_cache()
 
     def _load_with_cpu_offload(self, checkpoint: Checkpoint, config: ModelConfig) -> None:
-        device = torch.device("cuda")
+        device = self.embedding.weight.device
         cache = ExpertCache(
             num_experts=config.num_experts,
             experts_per_token=config.experts_per_token,
             device=device,
         )
 
-        # Determine how many hot layers can be cached on GPU
-        _n_cache = cache.init_layer_cache(max_layers=10)
+        # Hot-layer cache capacity is determined after the first layer is
+        # registered (register_layer computes _cache_bytes_per_layer).
+        _n_cache = 0
 
         # Phase 1: load non-MLP params normally (small, stay on GPU)
         for name, param in self.named_parameters():
@@ -1110,9 +1111,14 @@ class Transformer(torch.nn.Module):
                 mlp.mlp2_weight_mx = torch.empty(1, device=device)
                 mlp.mlp1_weight = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
                 mlp.mlp1_bias = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
+                mlp.mlp2_weight = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
                 mlp.mlp2_bias = torch.nn.Parameter(torch.empty(1, device=device), requires_grad=False)
 
             torch.cuda.empty_cache()
+
+            # After the first layer registers, we know per-layer byte size
+            if block_idx == 0:
+                _n_cache = cache.init_layer_cache(max_layers=10)
 
         # Restore offloaded tensors to GPU
         def _restore_to_gpu(model, attr_path):
