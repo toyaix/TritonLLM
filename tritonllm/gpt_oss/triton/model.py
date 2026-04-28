@@ -863,6 +863,13 @@ class MLPBlock(torch.nn.Module):
         cache.route_to_matmul_proxies()
         cache._g_x.copy_(t)
         cache.decode_graph.replay()
+
+        if self.layer_idx == 0 and cache._miss_count + cache._hit_count > 0:
+            hr = cache.hit_rate()
+            print(f"[gpu_layer reuse] hit={cache._hit_count} miss={cache._miss_count} "
+                  f"rate={hr:.1%}", flush=True)
+            cache.reset_hit_rate()
+
         return cache._g_out
 
 class TransformerBlock(torch.nn.Module):

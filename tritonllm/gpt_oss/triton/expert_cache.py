@@ -55,6 +55,10 @@ class ExpertCache:
         self.gpu_cache: dict[int, dict[str, torch.Tensor]] = {}
         self._cache_bytes_per_layer: int = 0
 
+        # Hit/miss counters for gpu_layer reuse across tokens
+        self._hit_count: int = 0
+        self._miss_count: int = 0
+
         # Per-layer CUDA graph: gate routing (captured once, shared across layers)
         self.route_graph: torch.cuda.CUDAGraph | None = None
         self._gr_t: torch.Tensor | None = None        # input activation buffer
@@ -222,7 +226,10 @@ class ExpertCache:
     def ensure_experts(self, layer_idx: int, expert_ids: list[int]) -> None:
         """Copy expert weights to GPU shared buffers if not already present.
 
-        Uses GPU→GPU D2D copy for hot-cached layers, CPU→GPU copy otherwise.
+        Two-path lookup:
+        1. Hot-layer cache: entire layer permanently on GPU → D2D copy
+        2. CPU→GPU copy: skips experts whose slot already holds this layer's data
+           (retained from a previous token), tracked via gpu_layer.
         """
         gpu_w1_raw = self.gpu_w1.storage.data
         gpu_w2_raw = self.gpu_w2.storage.data
@@ -237,9 +244,9 @@ class ExpertCache:
             else self.gpu_w2_mx
         )
 
+        # Path 1: hot-layer cache
         cached = self.gpu_cache.get(layer_idx)
         if cached is not None:
-            # Hot-layer path: D2D copy from permanent GPU cache
             cw1 = cached["w1"]
             cw1_mx = cached["w1_mx"]
             cb1 = cached["b1"]
@@ -261,22 +268,33 @@ class ExpertCache:
                 self.gpu_layer[eid_i] = layer_idx
             return
 
-        # Cold-layer path: CPU→GPU copy from pageable CPU storage
+        # Path 2: CPU→GPU copy, skipping experts already resident from previous tokens
         cpu_layer = self.cpu[layer_idx]
+
         for eid in expert_ids:
             eid_i = int(eid)
             if self.gpu_layer[eid_i] == layer_idx:
+                self._hit_count += 1
                 continue
+            self._miss_count += 1
             cw = cpu_layer[eid_i]
             gpu_w1_raw[eid_i].copy_(cw["w1"])
-            if gpu_w1_mx_raw is not None and cw["w1_mx"] is not None:
+            if gpu_w1_mx_raw is not None and cw.get("w1_mx") is not None:
                 gpu_w1_mx_raw[eid_i].copy_(cw["w1_mx"])
             self.gpu_b1[eid_i].copy_(cw["b1"])
             gpu_w2_raw[eid_i].copy_(cw["w2"])
-            if gpu_w2_mx_raw is not None and cw["w2_mx"] is not None:
+            if gpu_w2_mx_raw is not None and cw.get("w2_mx") is not None:
                 gpu_w2_mx_raw[eid_i].copy_(cw["w2_mx"])
             self.gpu_b2[eid_i].copy_(cw["b2"])
             self.gpu_layer[eid_i] = layer_idx
+
+    def reset_hit_rate(self) -> None:
+        self._hit_count = 0
+        self._miss_count = 0
+
+    def hit_rate(self) -> float:
+        total = self._hit_count + self._miss_count
+        return self._hit_count / total if total > 0 else 0.0
 
     def load_all_experts(self, layer_idx: int) -> None:
         """Load every expert for *layer_idx* into the GPU buffers (for prefill)."""
