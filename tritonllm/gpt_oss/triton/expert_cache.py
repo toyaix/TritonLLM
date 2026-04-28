@@ -30,8 +30,11 @@ class ExpertCache:
         self.experts_per_token = experts_per_token
         self.device = device
 
-        # Per-layer pageable CPU storage — contiguous per-tensor
+        # Per-layer pageable CPU storage — contiguous per-tensor (FP4/uint8, swizzled)
         self.cpu: dict[int, dict[str, torch.Tensor]] = {}
+
+        # Per-layer simple (non-swizzled) FP4 CPU storage for CPU-side expert compute
+        self.cpu_fp4: dict[int, dict[str, torch.Tensor]] = {}
 
         # Global GPU buffers — the custom Tensor objects themselves
         self.gpu_w1 = None
@@ -81,10 +84,13 @@ class ExpertCache:
         w2,
         w2_mx,
         b2: torch.Tensor,
+        store_cpu: bool = True,
     ) -> None:
-        """Store pageable CPU copies and initialise shared GPU buffers.
+        """Initialise shared GPU buffers, optionally store pageable CPU copies.
 
         Called once per MLP layer after weight loading + quantization.
+        When ``store_cpu=False``, only the GPU buffers are set up (first call)
+        and CPU storage is skipped to save memory.
         """
         if self.gpu_w1 is None:
             self.gpu_w1 = w1
@@ -99,12 +105,101 @@ class ExpertCache:
             )
             self.gpu_layer = [-1] * self.num_experts
 
-        # Store pageable CPU tensors — one contiguous tensor per component,
-        # shape (num_experts, ...), matching the GPU buffer layout.
-        cpu_layer: dict[str, torch.Tensor] = {}
-        for key, gpu_tensor in self._iter_tensors(w1, w1_mx, b1, w2, w2_mx, b2):
-            cpu_layer[key] = self._gpu_to_pageable_cpu(gpu_tensor)
-        self.cpu[layer_idx] = cpu_layer
+        if store_cpu:
+            cpu_layer: dict[str, torch.Tensor] = {}
+            for key, gpu_tensor in self._iter_tensors(w1, w1_mx, b1, w2, w2_mx, b2):
+                cpu_layer[key] = self._gpu_to_pageable_cpu(gpu_tensor)
+            self.cpu[layer_idx] = cpu_layer
+
+    def register_cpu_fp4(
+        self,
+        layer_idx: int,
+        w1_fp4: torch.Tensor,
+        w1_scale: torch.Tensor,
+        b1: torch.Tensor,
+        w2_fp4: torch.Tensor,
+        w2_scale: torch.Tensor,
+        b2: torch.Tensor,
+    ) -> None:
+        """Store simple (non-swizzled) FP4 weights on CPU.
+
+        These are used for CPU-side expert computation: only the 4 activated
+        experts are dequantized on-the-fly per layer per token.
+        """
+        self.cpu_fp4[layer_idx] = {
+            "w1": w1_fp4.detach().cpu(),
+            "w1_scale": w1_scale.detach().cpu(),
+            "b1": b1.detach().cpu(),
+            "w2": w2_fp4.detach().cpu(),
+            "w2_scale": w2_scale.detach().cpu(),
+            "b2": b2.detach().cpu(),
+        }
+
+    # ------------------------------------------------------------------
+    # CPU-side expert forward (decode, batch=1)
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def cpu_expert_forward(
+        self,
+        layer_idx: int,
+        x: torch.Tensor,
+        expert_ids: list[int],
+        gate_weights: torch.Tensor,
+        swiglu_limit: float = 7.0,
+    ) -> torch.Tensor:
+        """Compute expert MLP on CPU, return result on GPU.
+
+        Dequantizes only the activated experts' FP4 weights to BF16 on
+        CPU, computes the matmuls, then discards the temporary BF16.
+        Total data read from CPU RAM: ~25 MB per layer (4 × ~6.3 MB FP4).
+        """
+        from triton_kernels.numerics_details.mxfp import upcast_from_mxfp_torch
+
+        fp4 = self.cpu_fp4[layer_idx]
+        device = x.device
+        hidden = x.shape[1]
+
+        x_cpu = x.cpu()  # [1, hidden] bf16 → CPU
+        result = torch.zeros(1, hidden, dtype=torch.float32)
+
+        for i, eid in enumerate(expert_ids):
+            eid_i = int(eid)
+
+            # Dequantize FP4 → BF16 for this expert
+            w1_bf16 = upcast_from_mxfp_torch(
+                fp4["w1"][eid_i], fp4["w1_scale"][eid_i],
+                torch.bfloat16, axis=0,
+            )  # [intermediate, hidden*2]
+            w2_bf16 = upcast_from_mxfp_torch(
+                fp4["w2"][eid_i], fp4["w2_scale"][eid_i],
+                torch.bfloat16, axis=0,
+            )  # [hidden, intermediate]
+
+            intermediate = w1_bf16.shape[0]
+
+            # ---- gate + up matmul ----
+            w1_e = (
+                w1_bf16
+                .reshape(intermediate, 2, hidden)
+                .permute(1, 0, 2)
+                .reshape(intermediate * 2, hidden)
+            )
+            b1_e = fp4["b1"][eid_i]
+            gate_up = torch.nn.functional.linear(x_cpu, w1_e, b1_e)
+
+            # SiLU gate
+            gate, up = gate_up.chunk(2, dim=-1)
+            gate = gate.clamp(-swiglu_limit, swiglu_limit)
+            activated = torch.nn.functional.silu(gate) * up
+
+            # ---- down matmul ----
+            b2_e = fp4["b2"][eid_i]
+            down = torch.nn.functional.linear(activated, w2_bf16, b2_e)
+
+            result += down * float(gate_weights[i])
+
+        return result.to(device=device, dtype=torch.bfloat16)
 
     def _gpu_to_pageable_cpu(self, gpu_tensor) -> torch.Tensor:
         """Copy the entire GPU tensor into a contiguous pageable CPU tensor."""
