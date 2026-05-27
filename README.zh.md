@@ -63,9 +63,10 @@ tritonllm --help
 ### 使用方法
 
 ```
-usage: tritonllm [-h] [-r REASONING_EFFORT] [-a] [-b] [--show-browser-results] [-p]
+usage: tritonllm [-h] [--version] [-r REASONING_EFFORT] [-a] [-b]
+                 [--show-browser-results] [-p]
                  [--developer-message DEVELOPER_MESSAGE] [-c CONTEXT] [--raw]
-                 [FILE]
+                 [--cpu-offload] [FILE]
 ```
 
 ## 位置参数
@@ -79,6 +80,7 @@ usage: tritonllm [-h] [-r REASONING_EFFORT] [-a] [-b] [--show-browser-results] [
 | 参数 | 说明 |
 |------|------|
 | `-h, --help` | 显示帮助信息并退出。 |
+| `--version` | 显示已安装的 `tritonllm` 版本并退出。 |
 | `-r REASONING_EFFORT, --reasoning-effort REASONING_EFFORT` | 设置推理努力等级（`low` / `medium` / `high`）。默认：`high`。 |
 | `-a, --apply-patch` | 使模型可使用内部 `apply_patch` 函数。默认：`False`。 |
 | `-b, --browser` | 启用浏览器工具，让模型可以抓取网页内容。默认：`False`。 |
@@ -87,6 +89,7 @@ usage: tritonllm [-h] [-r REASONING_EFFORT] [-a] [-b] [--show-browser-results] [
 | `--developer-message DEVELOPER_MESSAGE` | 提供开发者/系统消息以影响模型行为。 |
 | `-c CONTEXT, --context CONTEXT` | 最大上下文长度（Token 数）。默认：`8192`。 |
 | `--raw` | 原始模式，禁用 Harmony 编码并输出纯文本。默认：`False`。 |
+| `--cpu-offload` | 为 MoE expert 权重启用 CPU offload。默认：`None`。 |
 
 
 ## 源码安装
