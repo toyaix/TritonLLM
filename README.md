@@ -55,9 +55,10 @@ tritonllm --help
 ### Usage
 
 ```shell
-usage: tritonllm [-h] [-r REASONING_EFFORT] [-a] [-b] [--show-browser-results] [-p]
+usage: tritonllm [-h] [--version] [-r REASONING_EFFORT] [-a] [-b]
+                 [--show-browser-results] [-p]
                  [--developer-message DEVELOPER_MESSAGE] [-c CONTEXT] [--raw]
-                 [FILE]
+                 [--cpu-offload] [FILE]
 
 ```
 
@@ -72,6 +73,7 @@ usage: tritonllm [-h] [-r REASONING_EFFORT] [-a] [-b] [--show-browser-results] [
 | Option | Description |
 |--------|-------------|
 | `-h, --help` | Show this help message and exit. |
+| `--version` | Show the installed `tritonllm` version and exit. |
 | `-r REASONING_EFFORT, --reasoning-effort REASONING_EFFORT` | Set reasoning effort level (`low` / `medium` / `high`). Default: `high`. |
 | `-a, --apply-patch` | Make the internal `apply_patch` function available to the model. Default: `False`. |
 | `-b, --browser` | Enable browser tool so the model can fetch web content. Default: `False`. |
@@ -80,6 +82,7 @@ usage: tritonllm [-h] [-r REASONING_EFFORT] [-a] [-b] [--show-browser-results] [
 | `--developer-message DEVELOPER_MESSAGE` | Provide a developer/system message that influences the model’s behavior. |
 | `-c CONTEXT, --context CONTEXT` | Maximum context length (tokens). Default: `8192`. |
 | `--raw` | Raw mode. Disable Harmony encoding and render plain output. Default: `False`. |
+| `--cpu-offload` | Enable CPU offload for MoE expert weights. Default: `None`. |
 
 
 ## Install from source
