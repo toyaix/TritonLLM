@@ -85,7 +85,7 @@ usage: tritonllm [-h] [-r REASONING_EFFORT] [-a] [-b] [--show-browser-results] [
 | `--show-browser-results` | 在输出中显示抓取的浏览器结果。默认：`False`。 |
 | `-p, --python` | 启用 Python 执行工具（允许模型运行 Python 代码片段）。默认：`False`。 |
 | `--developer-message DEVELOPER_MESSAGE` | 提供开发者/系统消息以影响模型行为。 |
-| `-c CONTEXT, --context CONTEXT` | 最大上下文长度（Token 数）。默认：`8192`。 |
+| `-c CONTEXT, --context CONTEXT` | 最大上下文长度（Token 数）。默认：`131072`。 |
 | `--raw` | 原始模式，禁用 Harmony 编码并输出纯文本。默认：`False`。 |
 
 

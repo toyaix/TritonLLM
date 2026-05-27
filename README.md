@@ -78,7 +78,7 @@ usage: tritonllm [-h] [-r REASONING_EFFORT] [-a] [-b] [--show-browser-results] [
 | `--show-browser-results` | Show fetched browser results in the output. Default: `False`. |
 | `-p, --python` | Enable Python execution tool (run Python snippets). Default: `False`. |
 | `--developer-message DEVELOPER_MESSAGE` | Provide a developer/system message that influences the model’s behavior. |
-| `-c CONTEXT, --context CONTEXT` | Maximum context length (tokens). Default: `8192`. |
+| `-c CONTEXT, --context CONTEXT` | Maximum context length (tokens). Default: `131072`. |
 | `--raw` | Raw mode. Disable Harmony encoding and render plain output. Default: `False`. |
 
 
